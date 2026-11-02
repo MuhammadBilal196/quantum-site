@@ -1,0 +1,799 @@
+# quantum-site / markdown — Markdown to HTML (CommonMark core + GitHub extras)
+#
+#   Markdown.render("# Hi\n\nSome *text* and `code`.")
+#   # <h1 id="hi">Hi</h1>
+#   # <p>Some <em>text</em> and <code>code</code>.</p>
+#
+#   Markdown.headings(text)   # [{"level": 2, "text": "Install", "id": "install"}, ...]
+#   Markdown.toc(text)        # <nav class="toc"> list of h2/h3 links
+#
+# Blocks: ATX headings (with ids), paragraphs, hard breaks, fenced and indented code,
+# block quotes, nested ordered/unordered lists, task lists, tables with alignment,
+# horizontal rules, raw HTML blocks, reference link definitions.
+# Inline: **strong**, *em*, _em_, ~~strike~~, `code`, [links](url "title"),
+# ![images](src), [ref][links], <autolinks>, bare https:// links, \escapes, inline HTML.
+#
+# Exposes the global: Markdown
+
+# @use ./util.sa
+
+class __QMarkdown {
+    fn init() {
+        self.ids = {}
+        self.refs = {}
+        self.BREAK = chr(2)
+    }
+
+    # ── public API ───────────────────────────────────────────────────────
+
+    fn render(text) {
+        if text == null { return "" }
+        self.ids = {}
+        self.refs = {}
+        let lines = self.collectRefs(SiteUtil.normalizeNewlines(text).split("\n"))
+        return self.renderBlocks(lines)
+    }
+
+    fn renderInline(text) {
+        if text == null { return "" }
+        return self.inline(SiteUtil.text(text)).replaceAll(self.BREAK, "<br>\n")
+    }
+
+    # Headings outside code blocks, with the same ids render() gives them.
+    fn headings(text) {
+        let saved = self.ids
+        self.ids = {}
+        let out = []
+        let fence = ""
+        for line in SiteUtil.normalizeNewlines(text).split("\n") {
+            let t = line.trim()
+            if fence != "" {
+                if t.startsWith(fence) { fence = "" }
+                continue
+            }
+            if t.startsWith("```") or t.startsWith("~~~") {
+                fence = t.slice(0, 3)
+                continue
+            }
+            let h = self.headingOf(line)
+            if h != null {
+                let html = self.inline(h["text"])
+                let plain = SiteUtil.stripTags(html)
+                out.push({"level": h["level"], "text": plain, "id": self.uniqueId(plain)})
+            }
+        }
+        self.ids = saved
+        return out
+    }
+
+    # A table of contents for levels minLevel..maxLevel (default 2..3), or "".
+    fn toc(text, minLevel, maxLevel) {
+        if minLevel == null { minLevel = 2 }
+        if maxLevel == null { maxLevel = 3 }
+        let items = []
+        for h in self.headings(text) {
+            if h["level"] >= minLevel and h["level"] <= maxLevel {
+                items.push("<li class=\"toc-h" + SiteUtil.text(h["level"]) + "\"><a href=\"#" + h["id"] + "\">"
+                    + SiteUtil.escapeHtml(h["text"]) + "</a></li>")
+            }
+        }
+        if len(items) == 0 { return "" }
+        return "<nav class=\"toc\"><ul>\n" + items.join("\n") + "\n</ul></nav>"
+    }
+
+    # ── reference definitions: [label]: url "title" ──────────────────────
+
+    fn collectRefs(lines) {
+        let kept = []
+        let fence = ""
+        for line in lines {
+            let t = line.trim()
+            if fence != "" {
+                if t.startsWith(fence) { fence = "" }
+                kept.push(line)
+                continue
+            }
+            if t.startsWith("```") or t.startsWith("~~~") {
+                fence = t.slice(0, 3)
+                kept.push(line)
+                continue
+            }
+            let ref = null
+            if t.startsWith("[") and not t.startsWith("[^") and SiteUtil.indentOf(line) < 4 {
+                ref = self.refOf(t)
+            }
+            if ref == null {
+                kept.push(line)
+            } else {
+                self.refs[ref["label"]] = ref
+            }
+        }
+        return kept
+    }
+
+    fn refOf(t) {
+        let close = t.indexOf("]:")
+        if close < 2 { return null }
+        let label = t.slice(1, close).trim().lower()
+        let rest = t.slice(close + 2).trim()
+        if rest == "" or label == "" { return null }
+        let dest = self.destination(rest)
+        return {"label": label, "url": dest["url"], "title": dest["title"]}
+    }
+
+    # 'url "title"' -> {"url", "title"}
+    fn destination(inside) {
+        let s = inside.trim()
+        let url = s
+        let title = null
+        let space = s.indexOf(" ")
+        if space > 0 {
+            url = s.slice(0, space)
+            let rest = s.slice(space + 1).trim()
+            if len(rest) >= 2 {
+                let q = rest[0]
+                if (q == "\"" or q == "'" or q == "(") and len(rest) >= 2 {
+                    title = rest.slice(1, len(rest) - 1)
+                }
+            }
+        }
+        if url.startsWith("<") and url.endsWith(">") { url = url.slice(1, len(url) - 1) }
+        return {"url": url, "title": title}
+    }
+
+    # ── blocks ───────────────────────────────────────────────────────────
+
+    fn renderBlocks(lines) {
+        let out = []
+        let para = []
+        let i = 0
+        let n = len(lines)
+        while i < n {
+            let line = lines[i]
+            let t = line.trim()
+
+            if t == "" {
+                self.flushPara(para, out)
+                para = []
+                i += 1
+                continue
+            }
+
+            # fenced code
+            if t.startsWith("```") or t.startsWith("~~~") {
+                self.flushPara(para, out)
+                para = []
+                let fence = t.slice(0, 3)
+                let info = t.slice(3).trim()
+                let lang = info == "" ? "" : SiteUtil.words(info)[0]
+                let indent = SiteUtil.indentOf(line)
+                let code = []
+                i += 1
+                while i < n and not lines[i].trim().startsWith(fence) {
+                    code.push(SiteUtil.dedent(lines[i], indent))
+                    i += 1
+                }
+                i += 1
+                let cls = lang == "" ? "" : " class=\"language-" + SiteUtil.escapeHtml(lang) + "\""
+                let body = code.join("\n")
+                if len(code) > 0 { body += "\n" }
+                out.push("<pre><code" + cls + ">" + SiteUtil.escapeHtml(body) + "</code></pre>")
+                continue
+            }
+
+            # indented code (not inside a paragraph)
+            if len(para) == 0 and SiteUtil.indentOf(line) >= 4 {
+                let code = []
+                while i < n and (SiteUtil.indentOf(lines[i]) >= 4 or lines[i].trim() == "") {
+                    code.push(SiteUtil.dedent(lines[i], 4))
+                    i += 1
+                }
+                while len(code) > 0 and code[len(code) - 1].trim() == "" { code.pop() }
+                out.push("<pre><code>" + SiteUtil.escapeHtml(code.join("\n") + "\n") + "</code></pre>")
+                continue
+            }
+
+            # heading
+            let h = self.headingOf(line)
+            if h != null {
+                self.flushPara(para, out)
+                para = []
+                let html = self.inline(h["text"])
+                let hid = self.uniqueId(SiteUtil.stripTags(html))
+                let tag = "h" + SiteUtil.text(h["level"])
+                out.push("<" + tag + " id=\"" + hid + "\">" + html + "</" + tag + ">")
+                i += 1
+                continue
+            }
+
+            # horizontal rule
+            if self.isRule(t) {
+                self.flushPara(para, out)
+                para = []
+                out.push("<hr>")
+                i += 1
+                continue
+            }
+
+            # block quote
+            if t.startsWith(">") {
+                self.flushPara(para, out)
+                para = []
+                let quoted = []
+                while i < n and lines[i].trim().startsWith(">") {
+                    let q = lines[i].trim().slice(1)
+                    if q.startsWith(" ") { q = q.slice(1) }
+                    quoted.push(q)
+                    i += 1
+                }
+                out.push("<blockquote>\n" + self.renderBlocks(quoted) + "\n</blockquote>")
+                continue
+            }
+
+            # table: a row with pipes followed by a delimiter row
+            if t.contains("|") and i + 1 < n and self.isTableRule(lines[i + 1].trim()) {
+                self.flushPara(para, out)
+                para = []
+                let tableEnd = self.renderTable(lines, i, out)
+                i = tableEnd
+                continue
+            }
+
+            # list
+            let marker = self.listMarker(line)
+            if marker != null and (len(para) == 0 or not marker["ordered"] or marker["start"] == 1) {
+                self.flushPara(para, out)
+                para = []
+                i = self.renderList(lines, i, out)
+                continue
+            }
+
+            # raw HTML block
+            if len(para) == 0 and self.isHtmlStart(t) {
+                let block = []
+                while i < n and lines[i].trim() != "" {
+                    block.push(lines[i])
+                    i += 1
+                }
+                out.push(block.join("\n"))
+                continue
+            }
+
+            para.push(line)
+            i += 1
+        }
+        self.flushPara(para, out)
+        return out.join("\n")
+    }
+
+    fn flushPara(para, out) {
+        if len(para) == 0 { return }
+        let parts = []
+        for j in range(len(para)) {
+            let line = para[j]
+            let last = j == len(para) - 1
+            let body = line.trim()
+            if not last and (line.endsWith("  ") or body.endsWith("\\")) {
+                if body.endsWith("\\") { body = body.slice(0, len(body) - 1) }
+                parts.push(SiteUtil.trimEnd(body) + self.BREAK)
+            } else {
+                parts.push(body)
+            }
+        }
+        let html = self.inline(parts.join("\n"))
+        out.push("<p>" + html.replaceAll(self.BREAK + "\n", "<br>\n").replaceAll(self.BREAK, "<br>\n") + "</p>")
+    }
+
+    # {"level", "text"} for "## Title ##", else null.
+    fn headingOf(line) {
+        if SiteUtil.indentOf(line) > 3 { return null }
+        let t = line.trim()
+        if not t.startsWith("#") { return null }
+        let level = 0
+        while level < len(t) and t[level] == "#" { level += 1 }
+        if level > 6 { return null }
+        if level < len(t) and t[level] != " " and t[level] != "\t" { return null }
+        let body = t.slice(level).trim()
+        # optional closing hashes
+        let k = len(body)
+        while k > 0 and body[k - 1] == "#" { k -= 1 }
+        if k < len(body) and (k == 0 or body[k - 1] == " ") { body = body.slice(0, k).trim() }
+        return {"level": level, "text": body}
+    }
+
+    fn uniqueId(text) {
+        let base = SiteUtil.slugify(text)
+        if base == "" { base = "section" }
+        if not (base in self.ids) {
+            self.ids[base] = 1
+            return base
+        }
+        let count = self.ids[base]
+        let candidate = base + "-" + SiteUtil.text(count)
+        while candidate in self.ids {
+            count += 1
+            candidate = base + "-" + SiteUtil.text(count)
+        }
+        self.ids[base] = count + 1
+        self.ids[candidate] = 1
+        return candidate
+    }
+
+    fn isRule(t) {
+        if len(t) < 3 { return false }
+        let ch = t[0]
+        if ch != "-" and ch != "*" and ch != "_" { return false }
+        let count = 0
+        for i in range(len(t)) {
+            if t[i] == ch {
+                count += 1
+            } else if t[i] != " " and t[i] != "\t" {
+                return false
+            }
+        }
+        return count >= 3
+    }
+
+    fn isHtmlStart(t) {
+        if len(t) < 3 or t[0] != "<" { return false }
+        let c = t[1]
+        return c.isalpha() or c == "/" or c == "!"
+    }
+
+    # ── lists ────────────────────────────────────────────────────────────
+
+    # {"ordered", "start", "indent", "width", "text"} or null
+    fn listMarker(line) {
+        let indent = SiteUtil.indentOf(line)
+        let t = SiteUtil.dedent(line, indent)
+        if t == "" { return null }
+        let c = t[0]
+        if (c == "-" or c == "*" or c == "+") and (len(t) == 1 or t[1] == " " or t[1] == "\t") {
+            if self.isRule(t.trim()) { return null }
+            return {"ordered": false, "start": 1, "indent": indent, "width": 2, "text": t.slice(1).trim(), "bullet": c}
+        }
+        let k = 0
+        while k < len(t) and k < 9 and t[k].isdigit() { k += 1 }
+        if k > 0 and k < len(t) and (t[k] == "." or t[k] == ")") and (k + 1 == len(t) or t[k + 1] == " ") {
+            return {"ordered": true, "start": num(t.slice(0, k)), "indent": indent, "width": k + 2,
+                "text": t.slice(k + 1).trim(), "bullet": t[k]}
+        }
+        return null
+    }
+
+    # Renders the list starting at lines[i]; returns the index after it.
+    fn renderList(lines, i, out) {
+        let n = len(lines)
+        let first = self.listMarker(lines[i])
+        let base = first["indent"]
+        let ordered = first["ordered"]
+        let items = []
+        let current = null
+        let loose = false
+        let blankBefore = false
+        while i < n {
+            let line = lines[i]
+            if line.trim() == "" {
+                blankBefore = true
+                i += 1
+                continue
+            }
+            let m = self.listMarker(line)
+            let indent = SiteUtil.indentOf(line)
+            if m != null and m["indent"] <= base + 1 and m["indent"] >= base - 1 {
+                if m["ordered"] != ordered { break }
+                if blankBefore and current != null { loose = true }
+                current = {"lines": [m["text"]], "width": m["width"] + indent}
+                items.push(current)
+                blankBefore = false
+                i += 1
+                continue
+            }
+            if indent > base and current != null {
+                if blankBefore {
+                    current["lines"].push("")
+                    loose = true
+                }
+                current["lines"].push(SiteUtil.dedent(line, current["width"]))
+                blankBefore = false
+                i += 1
+                continue
+            }
+            # lazy paragraph continuation
+            if not blankBefore and current != null and m == null and not self.startsBlock(line) {
+                current["lines"].push(line.trim())
+                i += 1
+                continue
+            }
+            break
+        }
+        # A trailing blank line does not make the list loose.
+        let tag = ordered ? "ol" : "ul"
+        let openTag = "<" + tag
+        if ordered and first["start"] != 1 { openTag += " start=\"" + SiteUtil.text(first["start"]) + "\"" }
+        let hasTasks = false
+        let rendered = []
+        for item in items {
+            let body = item["lines"]
+            let task = ""
+            let head = body[0]
+            if head.startsWith("[ ] ") or head.startsWith("[x] ") or head.startsWith("[X] ") or head == "[ ]" or head == "[x]" {
+                let checked = head[1] != " "
+                task = "<input type=\"checkbox\" disabled" + (checked ? " checked" : "") + "> "
+                body[0] = head.slice(3).trim()
+                hasTasks = true
+            }
+            let html = self.renderBlocks(body)
+            if not loose { html = self.unwrapFirstParagraph(html) }
+            if task != "" {
+                if html.startsWith("<p>") {
+                    html = "<p>" + task + html.slice(3)
+                } else {
+                    html = task + html
+                }
+                rendered.push("<li class=\"task-list-item\">" + html + "</li>")
+            } else {
+                rendered.push("<li>" + html + "</li>")
+            }
+        }
+        if hasTasks { openTag += " class=\"task-list\"" }
+        out.push(openTag + ">\n" + rendered.join("\n") + "\n</" + tag + ">")
+        return i
+    }
+
+    fn unwrapFirstParagraph(html) {
+        if not html.startsWith("<p>") { return html }
+        let close = html.indexOf("</p>")
+        if close < 0 { return html }
+        return html.slice(3, close) + html.slice(close + 4)
+    }
+
+    fn startsBlock(line) {
+        let t = line.trim()
+        return t.startsWith("#") or t.startsWith(">") or t.startsWith("```") or t.startsWith("~~~") or self.isRule(t)
+    }
+
+    # ── tables ───────────────────────────────────────────────────────────
+
+    fn isTableRule(t) {
+        if not t.contains("-") { return false }
+        let pipes = t.contains("|")
+        for k in range(len(t)) {
+            let c = t[k]
+            if c != "|" and c != "-" and c != ":" and c != " " and c != "\t" { return false }
+        }
+        return pipes or t.contains(":")
+    }
+
+    fn cellsOf(row) {
+        let t = row.trim()
+        if t.startsWith("|") { t = t.slice(1) }
+        if t.endsWith("|") and not t.endsWith("\\|") { t = t.slice(0, len(t) - 1) }
+        let cells = []
+        let cell = []
+        let inCode = false
+        let k = 0
+        while k < len(t) {
+            let c = t[k]
+            if c == "\\" and k + 1 < len(t) and t[k + 1] == "|" {
+                cell.push("|")
+                k += 2
+                continue
+            }
+            if c == "`" { inCode = not inCode }
+            if c == "|" and not inCode {
+                cells.push(cell.join("").trim())
+                cell = []
+            } else {
+                cell.push(c)
+            }
+            k += 1
+        }
+        cells.push(cell.join("").trim())
+        return cells
+    }
+
+    fn renderTable(lines, i, out) {
+        let n = len(lines)
+        let header = self.cellsOf(lines[i])
+        let aligns = []
+        for spec in self.cellsOf(lines[i + 1]) {
+            let s = spec.trim()
+            let left = s.startsWith(":")
+            let right = s.endsWith(":")
+            if left and right {
+                aligns.push(" style=\"text-align:center\"")
+            } else if right {
+                aligns.push(" style=\"text-align:right\"")
+            } else if left {
+                aligns.push(" style=\"text-align:left\"")
+            } else {
+                aligns.push("")
+            }
+        }
+        let html = ["<table>", "<thead>", "<tr>"]
+        for c in range(len(header)) {
+            let a = c < len(aligns) ? aligns[c] : ""
+            html.push("<th" + a + ">" + self.inline(header[c]) + "</th>")
+        }
+        html.push("</tr>")
+        html.push("</thead>")
+        i += 2
+        let body = []
+        while i < n and lines[i].trim() != "" and lines[i].contains("|") {
+            let cells = self.cellsOf(lines[i])
+            body.push("<tr>")
+            for c in range(len(header)) {
+                let a = c < len(aligns) ? aligns[c] : ""
+                let v = c < len(cells) ? cells[c] : ""
+                body.push("<td" + a + ">" + self.inline(v) + "</td>")
+            }
+            body.push("</tr>")
+            i += 1
+        }
+        if len(body) > 0 {
+            html.push("<tbody>")
+            for row in body { html.push(row) }
+            html.push("</tbody>")
+        }
+        html.push("</table>")
+        out.push(html.join("\n"))
+        return i
+    }
+
+    # ── inline ───────────────────────────────────────────────────────────
+
+    fn inline(s) {
+        let out = []
+        let n = len(s)
+        let i = 0
+        let start = 0
+        while i < n {
+            let ch = s[i]
+
+            if ch == "\\" and i + 1 < n and SiteUtil.isPunct(s[i + 1]) {
+                self.flushText(s, start, i, out)
+                out.push(SiteUtil.escapeHtml(s[i + 1]))
+                i += 2
+                start = i
+                continue
+            }
+
+            if ch == "`" {
+                let run = 0
+                while i + run < n and s[i + run] == "`" { run += 1 }
+                let ticks = SiteUtil.repeatText("`", run)
+                let close = SiteUtil.indexFrom(s, ticks, i + run)
+                if close >= 0 {
+                    let code = s.slice(i + run, close)
+                    if len(code) >= 2 and code.startsWith(" ") and code.endsWith(" ") and code.trim() != "" {
+                        code = code.slice(1, len(code) - 1)
+                    }
+                    self.flushText(s, start, i, out)
+                    out.push("<code>" + SiteUtil.escapeHtml(code.replaceAll("\n", " ")) + "</code>")
+                    i = close + run
+                    start = i
+                } else {
+                    i += run
+                }
+                continue
+            }
+
+            if (ch == "!" and i + 1 < n and s[i + 1] == "[") or ch == "[" {
+                let image = ch == "!"
+                let link = self.linkAt(s, image ? i + 1 : i)
+                if link != null {
+                    self.flushText(s, start, i, out)
+                    let titleAttr = link["title"] == null ? "" : " title=\"" + SiteUtil.escapeHtml(link["title"]) + "\""
+                    if image {
+                        let alt = SiteUtil.stripTags(self.inline(link["text"]))
+                        out.push("<img src=\"" + SiteUtil.escapeHtml(link["url"]) + "\" alt=\"" + SiteUtil.escapeHtml(alt) + "\"" + titleAttr + ">")
+                    } else {
+                        out.push("<a href=\"" + SiteUtil.escapeHtml(link["url"]) + "\"" + titleAttr + ">" + self.inline(link["text"]) + "</a>")
+                    }
+                    i = link["end"]
+                    start = i
+                    continue
+                }
+                i += 1
+                continue
+            }
+
+            if ch == "<" {
+                let close = SiteUtil.indexFrom(s, ">", i + 1)
+                if close > i + 1 {
+                    let inner = s.slice(i + 1, close)
+                    if not inner.contains(" ") and (inner.startsWith("http://") or inner.startsWith("https://") or inner.startsWith("mailto:")) {
+                        self.flushText(s, start, i, out)
+                        out.push("<a href=\"" + SiteUtil.escapeHtml(inner) + "\">" + SiteUtil.escapeHtml(inner) + "</a>")
+                        i = close + 1
+                        start = i
+                        continue
+                    }
+                    if not inner.contains(" ") and inner.contains("@") and inner.contains(".") and not inner.contains("/") {
+                        self.flushText(s, start, i, out)
+                        out.push("<a href=\"mailto:" + SiteUtil.escapeHtml(inner) + "\">" + SiteUtil.escapeHtml(inner) + "</a>")
+                        i = close + 1
+                        start = i
+                        continue
+                    }
+                    let c = inner[0]
+                    if c.isalpha() or c == "/" or c == "!" {
+                        self.flushText(s, start, i, out)
+                        out.push(s.slice(i, close + 1))
+                        i = close + 1
+                        start = i
+                        continue
+                    }
+                }
+                i += 1
+                continue
+            }
+
+            if ch == "*" or ch == "_" or ch == "~" {
+                let em = self.emphasisAt(s, i)
+                if em != null {
+                    self.flushText(s, start, i, out)
+                    out.push(em["html"])
+                    i = em["end"]
+                    start = i
+                    continue
+                }
+                let run = 0
+                while i + run < n and s[i + run] == ch { run += 1 }
+                i += run
+                continue
+            }
+
+            if ch == "h" and (i == 0 or SiteUtil.isSpace(s[i - 1]) or s[i - 1] == "(") {
+                let head = s.slice(i, i + 8)
+                if head.startsWith("http://") or head == "https://" {
+                    let k = i
+                    while k < n and not SiteUtil.isSpace(s[k]) and s[k] != "<" { k += 1 }
+                    while k > i and ".,:;!?)'\"".contains(s[k - 1]) { k -= 1 }
+                    let url = s.slice(i, k)
+                    self.flushText(s, start, i, out)
+                    out.push("<a href=\"" + SiteUtil.escapeHtml(url) + "\">" + SiteUtil.escapeHtml(url) + "</a>")
+                    i = k
+                    start = i
+                    continue
+                }
+            }
+
+            i += 1
+        }
+        self.flushText(s, start, n, out)
+        return out.join("")
+    }
+
+    fn flushText(s, start, stop, out) {
+        if stop > start { out.push(SiteUtil.escapeHtml(s.slice(start, stop))) }
+    }
+
+    # Index of the bracket closing the one at s[open], honouring nesting and escapes.
+    fn matching(s, open, opener, closer) {
+        let depth = 0
+        let k = open
+        let n = len(s)
+        while k < n {
+            let c = s[k]
+            if c == "\\" {
+                k += 2
+                continue
+            }
+            if c == "`" {
+                let skip = SiteUtil.indexFrom(s, "`", k + 1)
+                if skip < 0 { return -1 }
+                k = skip + 1
+                continue
+            }
+            if c == opener {
+                depth += 1
+            } else if c == closer {
+                depth -= 1
+                if depth == 0 { return k }
+            }
+            k += 1
+        }
+        return -1
+    }
+
+    # [text](url "title"), [text][ref], [text][] or [ref] -> {"text", "url", "title", "end"}
+    fn linkAt(s, i) {
+        let close = self.matching(s, i, "[", "]")
+        if close < 0 { return null }
+        let text = s.slice(i + 1, close)
+        let n = len(s)
+        if close + 1 < n and s[close + 1] == "(" {
+            let paren = self.matching(s, close + 1, "(", ")")
+            if paren < 0 { return null }
+            let dest = self.destination(s.slice(close + 2, paren))
+            return {"text": text, "url": dest["url"], "title": dest["title"], "end": paren + 1}
+        }
+        let label = text
+        let end = close + 1
+        if close + 1 < n and s[close + 1] == "[" {
+            let close2 = SiteUtil.indexFrom(s, "]", close + 2)
+            if close2 < 0 { return null }
+            let given = s.slice(close + 2, close2)
+            if given != "" { label = given }
+            end = close2 + 1
+        }
+        let key = SiteUtil.collapseSpaces(label).lower()
+        if key in self.refs {
+            let ref = self.refs[key]
+            return {"text": text, "url": ref["url"], "title": ref["title"], "end": end}
+        }
+        return null
+    }
+
+    # **strong**, __strong__, *em*, _em_, ~~strike~~ at s[i] -> {"html", "end"} or null
+    fn emphasisAt(s, i) {
+        let n = len(s)
+        let ch = s[i]
+        let run = 0
+        while i + run < n and s[i + run] == ch { run += 1 }
+        if i + run >= n or SiteUtil.isSpace(s[i + run]) { return null }
+        if ch == "_" and i > 0 and SiteUtil.isWordChar(s[i - 1]) { return null }
+
+        if ch == "~" {
+            if run != 2 { return null }
+            let close = self.closingRun(s, ch, 2, i + 2)
+            if close < 0 { return null }
+            return {"html": "<del>" + self.inline(s.slice(i + 2, close)) + "</del>", "end": close + 2}
+        }
+
+        if run >= 3 {
+            let close3 = self.closingRun(s, ch, 3, i + 3)
+            if close3 >= 0 {
+                let body = self.inline(s.slice(i + 3, close3))
+                return {"html": "<em><strong>" + body + "</strong></em>", "end": close3 + 3}
+            }
+        }
+        if run >= 2 {
+            let close2 = self.closingRun(s, ch, 2, i + 2)
+            if close2 >= 0 {
+                return {"html": "<strong>" + self.inline(s.slice(i + 2, close2)) + "</strong>", "end": close2 + 2}
+            }
+        }
+        let close1 = self.closingRun(s, ch, 1, i + 1)
+        if close1 >= 0 {
+            return {"html": "<em>" + self.inline(s.slice(i + 1, close1)) + "</em>", "end": close1 + 1}
+        }
+        return null
+    }
+
+    # Start of the next run of exactly `size` delimiter chars that can close
+    # (not preceded by whitespace; for "_", not followed by a word character).
+    fn closingRun(s, ch, size, startAt) {
+        let n = len(s)
+        let k = startAt
+        while k < n {
+            let c = s[k]
+            if c == "`" {
+                let skip = SiteUtil.indexFrom(s, "`", k + 1)
+                if skip < 0 { return -1 }
+                k = skip + 1
+                continue
+            }
+            if c == "\\" {
+                k += 2
+                continue
+            }
+            if c == ch {
+                let run = 0
+                while k + run < n and s[k + run] == ch { run += 1 }
+                let after = k + run < n ? s[k + run] : ""
+                let okBefore = k > startAt and not SiteUtil.isSpace(s[k - 1])
+                let okAfter = ch != "_" or not SiteUtil.isWordChar(after)
+                if run == size and okBefore and okAfter { return k }
+                k += run
+                continue
+            }
+            k += 1
+        }
+        return -1
+    }
+}
+
+Markdown = __QMarkdown()
