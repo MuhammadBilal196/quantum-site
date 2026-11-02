@@ -1,0 +1,532 @@
+# quantum-site / site — builds a folder of Markdown + layouts into a static website
+#
+#   let report = Site.build({"root": "."})        # reads ./site.json, writes ./public
+#   print(Site.summary(report))
+#
+# Folder layout (every folder name can be changed in site.json):
+#
+#   site.json                 title, description, baseUrl, nav, params, ...
+#   content/                  pages: .md (Markdown) or .html (template) files
+#     about.md                -> public/about.html
+#     posts/2026-11-02-hi.md  -> public/posts/hi.html   (a blog post, dated from the name)
+#     images/logo.png         -> copied as is
+#   layouts/                  page, post, index, tag, tags, archive, 404 (.html templates)
+#     partials/header.html    {{> header}}
+#   static/                   copied to the output root (CSS, images, favicon, ...)
+#
+# Also generated: index.html (if content/ has none), tags/<tag>.html, tags/index.html,
+# archive.html, 404.html (each only when its layout exists), feed.xml (RSS),
+# sitemap.xml (needs baseUrl) and .nojekyll (for GitHub Pages).
+#
+# Exposes the global: Site
+
+# @use ./util.sa
+# @use ./frontmatter.sa
+# @use ./markdown.sa
+# @use ./template.sa
+
+class __QSite {
+    fn init() {
+        self.VERSION = "1.0.0"
+        self.CONFIG_FILE = "site.json"
+    }
+
+    fn defaults() {
+        return {
+            "title": "My Quantum Site",
+            "description": "",
+            "author": "",
+            "baseUrl": "",
+            "language": "en",
+            "contentDir": "content",
+            "layoutsDir": "layouts",
+            "staticDir": "static",
+            "outDir": "public",
+            "postsDir": "posts",
+            "drafts": false,
+            "feed": true,
+            "feedItems": 20,
+            "sitemap": true,
+            "tagPages": true,
+            "summaryWords": 40,
+            "recentPosts": 5,
+            "nav": [],
+            "params": {}
+        }
+    }
+
+    # ── configuration ────────────────────────────────────────────────────
+
+    fn loadConfig(root) {
+        let cfg = self.defaults()
+        let path = SiteUtil.joinPath(root, self.CONFIG_FILE)
+        if not os.path.exists(path) { return cfg }
+        let raw = SiteUtil.normalizeNewlines(SiteUtil.readText(path))
+        let parsed = null
+        let problem = ""
+        try {
+            parsed = JSON.parse(raw)
+        } catch (e) {
+            problem = str(e)
+        }
+        if problem != "" { raise "site.json is not valid JSON: " + problem }
+        if type(parsed) != "dict" { raise "site.json must contain a JSON object { ... }" }
+        return SiteUtil.merge(cfg, parsed)
+    }
+
+    # ── build ────────────────────────────────────────────────────────────
+
+    # options: "root" (default "."), "drafts", "outDir", "config" (dict merged over site.json)
+    fn build(options) {
+        if options == null { options = {} }
+        SiteUtil.liftStepLimit()
+        let root = options.get("root", ".")
+        let cfg = SiteUtil.merge(self.loadConfig(root), options.get("config", {}))
+        if "drafts" in options { cfg["drafts"] = options["drafts"] }
+        if "outDir" in options { cfg["outDir"] = options["outDir"] }
+
+        let report = {"pages": 0, "posts": 0, "tags": 0, "assets": 0, "files": [], "warnings": [], "seen": {},
+            "outDir": SiteUtil.joinPath(root, cfg["outDir"])}
+        let contentDir = SiteUtil.joinPath(root, cfg["contentDir"])
+        if not os.path.isdir(contentDir) {
+            raise "no '" + cfg["contentDir"] + "' folder in " + os.path.abspath(root) + ". Run `quantum-site init` to create a starter site."
+        }
+        let outDir = report["outDir"]
+        SiteUtil.ensureDir(outDir)
+
+        let layouts = self.loadLayouts(SiteUtil.joinPath(root, cfg["layoutsDir"]))
+        let pages = []
+        let assets = []
+        for rel in SiteUtil.listFiles(contentDir) {
+            let ext = SiteUtil.extOf(rel)
+            if ext == ".md" or ext == ".markdown" or ext == ".html" or ext == ".htm" {
+                let page = self.loadPage(contentDir, rel, cfg)
+                if page != null { pages.push(page) }
+            } else {
+                assets.push(rel)
+            }
+        }
+
+        let col = self.collect(pages, cfg)
+        let site = self.siteData(cfg, col)
+        report["posts"] = len(col["posts"])
+        report["tags"] = len(col["tags"])
+
+        let written = {}
+        for page in pages {
+            self.renderPage(page, site, layouts, outDir, report)
+            written[page["url"]] = true
+        }
+        self.renderGenerated(site, col, layouts, outDir, report, written)
+
+        if cfg["feed"] and len(col["posts"]) > 0 { self.writeFeed(site, col["posts"], cfg, outDir, report) }
+        if cfg["sitemap"] {
+            if SiteUtil.text(cfg["baseUrl"]) == "" {
+                self.warn(report, "sitemap.xml skipped: set \"baseUrl\" in site.json (e.g. https://you.github.io/blog)")
+            } else {
+                self.writeSitemap(site, report, outDir)
+            }
+        }
+
+        for rel in assets {
+            SiteUtil.copyFile(SiteUtil.joinPath(contentDir, rel), SiteUtil.joinPath(outDir, rel))
+            report["assets"] += 1
+        }
+        let staticDir = SiteUtil.joinPath(root, cfg["staticDir"])
+        for rel in SiteUtil.listFiles(staticDir) {
+            SiteUtil.copyFile(SiteUtil.joinPath(staticDir, rel), SiteUtil.joinPath(outDir, rel))
+            report["assets"] += 1
+        }
+        SiteUtil.writeText(SiteUtil.joinPath(outDir, ".nojekyll"), "")
+        return report
+    }
+
+    fn summary(report) {
+        let lines = [
+            "Built " + self.count(report["pages"], "page") + " (" + self.count(report["posts"], "post") + ", "
+                + self.count(report["tags"], "tag") + ") and copied " + self.count(report["assets"], "file")
+                + " into " + report["outDir"] + "/"
+        ]
+        for w in report["warnings"] { lines.push("  warning: " + w) }
+        return lines.join("\n")
+    }
+
+    fn count(n, word) {
+        return SiteUtil.text(n) + " " + word + (n == 1 ? "" : "s")
+    }
+
+    fn warn(report, message) {
+        if message in report["seen"] { return }
+        report["seen"][message] = true
+        report["warnings"].push(message)
+    }
+
+    # ── layouts ──────────────────────────────────────────────────────────
+
+    # {"post": {"tpl": compiled, "parent": "base"}, ...}; registers partials.
+    fn loadLayouts(dir) {
+        let layouts = {}
+        Template.clearPartials()
+        for rel in SiteUtil.listFiles(dir) {
+            let ext = SiteUtil.extOf(rel)
+            if ext != ".html" and ext != ".htm" and ext != ".xml" { continue }
+            let name = SiteUtil.stripExt(rel)
+            let source = SiteUtil.readText(SiteUtil.joinPath(dir, rel))
+            if name.startsWith("partials/") {
+                Template.registerPartial(name.slice(9), source)
+                continue
+            }
+            let doc = FrontMatter.parse(source)
+            layouts[name] = {
+                "tpl": Template.compile(doc["body"], "layouts/" + rel),
+                "parent": SiteUtil.text(doc["data"].get("layout", ""))
+            }
+        }
+        return layouts
+    }
+
+    fn applyLayouts(content, page, site, layouts, report) {
+        let name = self.layoutName(page.get("layout", "page"))
+        let html = content
+        let depth = 0
+        while name != "" {
+            if not (name in layouts) {
+                if len(layouts.keys()) > 0 {
+                    self.warn(report, "layout '" + name + "' not found (layouts/" + name + ".html), used by " + page["url"])
+                }
+                break
+            }
+            let lay = layouts[name]
+            html = Template.renderCompiled(lay["tpl"], {"site": site, "page": page, "content": html})
+            name = self.layoutName(lay["parent"])
+            depth += 1
+            if depth > 10 { raise "layouts nest too deeply (does '" + name + "' use itself?)" }
+        }
+        return html
+    }
+
+    fn layoutName(value) {
+        if value == null or value == false { return "" }
+        let s = SiteUtil.text(value).trim()
+        if s == "none" or s == "false" { return "" }
+        if s.endsWith(".html") { s = s.slice(0, len(s) - 5) }
+        return s
+    }
+
+    # ── pages ────────────────────────────────────────────────────────────
+
+    fn loadPage(contentDir, rel, cfg) {
+        let doc = FrontMatter.parse(SiteUtil.readText(SiteUtil.joinPath(contentDir, rel)))
+        let data = doc["data"]
+        let body = doc["body"]
+        if Template.truthy(data.get("draft", false)) and not cfg["drafts"] { return null }
+
+        let ext = SiteUtil.extOf(rel)
+        let isMarkdown = ext == ".md" or ext == ".markdown"
+        let dir = SiteUtil.dirOf(rel)
+        let file = SiteUtil.fileOf(SiteUtil.stripExt(rel))
+        let date = SiteUtil.text(data.get("date", ""))
+        let slug = file
+        if len(file) > 11 and file[10] == "-" and SiteUtil.parseDate(file.slice(0, 10)) != null {
+            if date == "" { date = file.slice(0, 10) }
+            slug = file.slice(11)
+        }
+        if SiteUtil.text(data.get("slug", "")) != "" { slug = SiteUtil.slugify(data["slug"]) }
+
+        let url = ""
+        let permalink = SiteUtil.text(data.get("permalink", ""))
+        if permalink != "" {
+            url = SiteUtil.normalizePath(permalink)
+            if url.startsWith("/") { url = url.slice(1) }
+            if url == "" or url.endsWith("/") { url += "index.html" }
+            if SiteUtil.extOf(url) == "" { url += ".html" }
+        } else {
+            url = SiteUtil.joinPath(dir, slug + ".html")
+        }
+
+        let section = dir
+        let slash = dir.indexOf("/")
+        if slash >= 0 { section = dir.slice(0, slash) }
+        let isPost = section == cfg["postsDir"] and slug != "index"
+
+        # A leading "# Title" becomes the title when front matter has none.
+        let title = SiteUtil.text(data.get("title", ""))
+        if title == "" and isMarkdown {
+            let lines = body.split("\n")
+            let k = 0
+            while k < len(lines) and lines[k].trim() == "" { k += 1 }
+            if k < len(lines) {
+                let h = Markdown.headingOf(lines[k])
+                if h != null and h["level"] == 1 {
+                    title = SiteUtil.stripTags(Markdown.renderInline(h["text"]))
+                    body = lines.slice(k + 1).join("\n")
+                }
+            }
+        }
+        if title == "" { title = url == "index.html" ? cfg["title"] : SiteUtil.titleFromSlug(slug) }
+
+        let page = SiteUtil.copyDict(data)
+        page["title"] = title
+        page["date"] = date
+        page["updated"] = SiteUtil.text(data.get("updated", ""))
+        page["slug"] = slug
+        page["url"] = url
+        page["source"] = rel
+        page["section"] = section
+        page["isPost"] = isPost
+        page["isHome"] = url == "index.html"
+        page["root"] = SiteUtil.rootPrefix(url)
+        page["tags"] = self.tagsOf(data.get("tags", []))
+        page["layout"] = data.get("layout", isPost ? "post" : "page")
+        page["body"] = body
+        page["isTemplate"] = not isMarkdown
+        if isMarkdown {
+            page["content"] = Markdown.render(body)
+            page["headings"] = Markdown.headings(body)
+            page["toc"] = Markdown.toc(body, 2, 3)
+        } else {
+            page["content"] = body
+            page["headings"] = []
+            page["toc"] = ""
+        }
+        let words = SiteUtil.wordCount(isMarkdown ? SiteUtil.stripTags(page["content"]) : SiteUtil.stripTags(body))
+        page["wordCount"] = words
+        page["readingTime"] = words < 200 ? 1 : floor((words + 199) / 200)
+        let given = SiteUtil.text(data.get("description", data.get("summary", "")))
+        page["summary"] = given != "" ? given : self.summaryOf(page["content"], cfg["summaryWords"])
+        return page
+    }
+
+    fn tagsOf(value) {
+        let out = []
+        let items = value
+        if type(value) == "string" { items = value.split(",") }
+        if type(items) != "array" { return out }
+        for t in items {
+            let s = SiteUtil.text(t).trim()
+            if s != "" { out.push(s) }
+        }
+        return out
+    }
+
+    # Plain text of the first paragraph, cut to `count` words.
+    fn summaryOf(html, count) {
+        let pStart = html.indexOf("<p>")
+        let text = html
+        if pStart >= 0 {
+            let pEnd = SiteUtil.indexFrom(html, "</p>", pStart)
+            if pEnd > pStart { text = html.slice(pStart + 3, pEnd) }
+        }
+        return SiteUtil.truncateWords(SiteUtil.stripTags(text), count)
+    }
+
+    fn linkOf(page) {
+        return {"title": page["title"], "url": page["url"], "date": page["date"]}
+    }
+
+    # ── collections: posts, pages, tags, years ───────────────────────────
+
+    fn collect(pages, cfg) {
+        let posts = []
+        let others = []
+        for p in pages {
+            if p["isPost"] {
+                posts.push(p)
+            } else {
+                others.push(p)
+            }
+        }
+        posts = SiteUtil.sortRecords(posts, "date", true)
+        let n = len(posts)
+        let tagMap = {}
+        for k in range(n) {
+            let p = posts[k]
+            p["newer"] = k > 0 ? self.linkOf(posts[k - 1]) : null
+            p["older"] = k + 1 < n ? self.linkOf(posts[k + 1]) : null
+            let links = []
+            for t in p["tags"] {
+                let slug = SiteUtil.slugify(t)
+                if slug == "" { continue }
+                if not (slug in tagMap) {
+                    tagMap[slug] = {"name": t, "slug": slug, "url": "tags/" + slug + ".html", "posts": []}
+                }
+                tagMap[slug]["posts"].push(p)
+                links.push({"name": t, "slug": slug, "url": "tags/" + slug + ".html"})
+            }
+            p["tagLinks"] = links
+        }
+        for p in others { p["tagLinks"] = [] }
+
+        let tags = []
+        for slug in SiteUtil.sortStrings(tagMap.keys()) {
+            let t = tagMap[slug]
+            t["count"] = len(t["posts"])
+            tags.push(t)
+        }
+
+        let years = []
+        let current = null
+        for p in posts {
+            let y = SiteUtil.formatDate(p["date"], "year")
+            if y == "" { y = "Undated" }
+            if current == null or current["year"] != y {
+                current = {"year": y, "posts": []}
+                years.push(current)
+            }
+            current["posts"].push(p)
+        }
+        return {"posts": posts, "pages": SiteUtil.sortRecords(others, "url", false), "tags": tags, "years": years}
+    }
+
+    fn siteData(cfg, col) {
+        let site = SiteUtil.copyDict(cfg)
+        let today = SiteUtil.today()
+        site["posts"] = col["posts"]
+        site["pages"] = col["pages"]
+        site["tags"] = col["tags"]
+        site["years"] = col["years"]
+        site["recent"] = col["posts"].slice(0, cfg["recentPosts"])
+        site["postCount"] = len(col["posts"])
+        site["buildDate"] = today
+        site["year"] = today.slice(0, 4)
+        site["generator"] = "quantum-site " + self.VERSION
+        return site
+    }
+
+    # ── rendering ────────────────────────────────────────────────────────
+
+    fn renderPage(page, site, layouts, outDir, report) {
+        let html = page["content"]
+        if page["isTemplate"] {
+            html = Template.renderCompiled(Template.compile(html, page["source"]), {"site": site, "page": page})
+            page["content"] = html
+        }
+        self.writePage(page, html, site, layouts, outDir, report)
+    }
+
+    fn writePage(page, content, site, layouts, outDir, report) {
+        let html = self.applyLayouts(content, page, site, layouts, report)
+        SiteUtil.writeText(SiteUtil.joinPath(outDir, page["url"]), html)
+        report["files"].push(page["url"])
+        report["pages"] += 1
+    }
+
+    fn virtualPage(url, title, layout, extra) {
+        let page = {
+            "title": title, "url": url, "root": SiteUtil.rootPrefix(url), "layout": layout,
+            "isHome": url == "index.html", "isPost": false, "content": "", "summary": "",
+            "date": "", "tags": [], "tagLinks": [], "toc": "", "headings": [], "section": "", "source": ""
+        }
+        if extra != null {
+            for k in extra.keys() { page[k] = extra[k] }
+        }
+        return page
+    }
+
+    fn renderGenerated(site, col, layouts, outDir, report, written) {
+        let generated = []
+        if not ("index.html" in written) {
+            if "index" in layouts {
+                generated.push(self.virtualPage("index.html", site["title"], "index",
+                    {"posts": col["posts"], "summary": site["description"]}))
+            } else {
+                self.warn(report, "no home page: add content/index.md or layouts/index.html")
+            }
+        }
+        if site["tagPages"] and "tag" in layouts {
+            for t in col["tags"] {
+                generated.push(self.virtualPage(t["url"], "Tagged \"" + t["name"] + "\"", "tag",
+                    {"tag": t, "posts": t["posts"]}))
+            }
+        }
+        if "tags" in layouts and not ("tags/index.html" in written) {
+            generated.push(self.virtualPage("tags/index.html", "Tags", "tags", {"tagList": col["tags"]}))
+        }
+        if "archive" in layouts and not ("archive.html" in written) {
+            generated.push(self.virtualPage("archive.html", "Archive", "archive", {"years": col["years"], "posts": col["posts"]}))
+        }
+        if "404" in layouts and not ("404.html" in written) {
+            generated.push(self.virtualPage("404.html", "Page not found", "404", null))
+        }
+        for page in generated {
+            self.writePage(page, "", site, layouts, outDir, report)
+        }
+    }
+
+    # ── feed and sitemap ─────────────────────────────────────────────────
+
+    fn absolute(base, url) {
+        let b = SiteUtil.text(base)
+        if b == "" { return url }
+        if b.endsWith("/") { b = b.slice(0, len(b) - 1) }
+        return b + "/" + url
+    }
+
+    fn writeFeed(site, posts, cfg, outDir, report) {
+        let base = SiteUtil.text(cfg["baseUrl"])
+        if base == "" { self.warn(report, "feed.xml links are relative: set \"baseUrl\" in site.json") }
+        let lines = [
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+            "<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\">",
+            "<channel>",
+            "  <title>" + SiteUtil.escapeHtml(site["title"]) + "</title>",
+            "  <link>" + SiteUtil.escapeHtml(self.absolute(base, "")) + "</link>",
+            "  <description>" + SiteUtil.escapeHtml(site["description"]) + "</description>",
+            "  <language>" + SiteUtil.escapeHtml(site["language"]) + "</language>",
+            "  <generator>" + SiteUtil.escapeHtml(site["generator"]) + "</generator>"
+        ]
+        if base != "" {
+            lines.push("  <atom:link href=\"" + SiteUtil.escapeHtml(self.absolute(base, "feed.xml")) + "\" rel=\"self\" type=\"application/rss+xml\"/>")
+        }
+        if len(posts) > 0 and posts[0]["date"] != "" {
+            lines.push("  <lastBuildDate>" + SiteUtil.formatDate(posts[0]["date"], "rfc822") + "</lastBuildDate>")
+        }
+        let limit = cfg["feedItems"]
+        for k in range(len(posts)) {
+            if k >= limit { break }
+            let p = posts[k]
+            let link = SiteUtil.escapeHtml(self.absolute(base, p["url"]))
+            lines.push("  <item>")
+            lines.push("    <title>" + SiteUtil.escapeHtml(p["title"]) + "</title>")
+            lines.push("    <link>" + link + "</link>")
+            lines.push("    <guid>" + link + "</guid>")
+            if p["date"] != "" { lines.push("    <pubDate>" + SiteUtil.formatDate(p["date"], "rfc822") + "</pubDate>") }
+            for t in p["tags"] { lines.push("    <category>" + SiteUtil.escapeHtml(t) + "</category>") }
+            lines.push("    <description>" + SiteUtil.escapeHtml(p["summary"]) + "</description>")
+            lines.push("  </item>")
+        }
+        lines.push("</channel>")
+        lines.push("</rss>")
+        SiteUtil.writeText(SiteUtil.joinPath(outDir, "feed.xml"), lines.join("\n") + "\n")
+    }
+
+    fn writeSitemap(site, report, outDir) {
+        let base = site["baseUrl"]
+        let lines = ["<?xml version=\"1.0\" encoding=\"UTF-8\"?>", "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">"]
+        for url in SiteUtil.sortStrings(report["files"]) {
+            if url == "404.html" { continue }
+            let loc = url == "index.html" ? self.absolute(base, "") : self.absolute(base, url)
+            lines.push("  <url><loc>" + SiteUtil.escapeHtml(loc) + "</loc></url>")
+        }
+        lines.push("</urlset>")
+        SiteUtil.writeText(SiteUtil.joinPath(outDir, "sitemap.xml"), lines.join("\n") + "\n")
+    }
+
+    # ── new post ─────────────────────────────────────────────────────────
+
+    # Creates content/<postsDir>/YYYY-MM-DD-<slug>.md and returns its path.
+    fn newPost(root, title, tags) {
+        let cfg = self.loadConfig(root)
+        let date = SiteUtil.today()
+        let slug = SiteUtil.slugify(title)
+        if slug == "" { raise "the post needs a title" }
+        let path = SiteUtil.joinPath(SiteUtil.joinPath(root, cfg["contentDir"]), cfg["postsDir"] + "/" + date + "-" + slug + ".md")
+        if os.path.exists(path) { raise path + " already exists" }
+        let data = {"title": title, "date": date, "tags": tags == null ? [] : tags, "draft": false}
+        let text = FrontMatter.stringify(data, ["title", "date", "tags", "draft"]) + "\nWrite your post here. **Markdown** works.\n"
+        SiteUtil.writeText(path, text)
+        return path
+    }
+}
+
+Site = __QSite()
