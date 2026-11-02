@@ -1,0 +1,119 @@
+# quantum-site / test harness — a tiny assertion recorder, so the tests need no packages
+#
+#   Check.section("Markdown")
+#   Check.eq("renders a heading", Markdown.render("# Hi"), "<h1 id=\"hi\">Hi</h1>")
+#   Check.report()      # prints the totals; raises (exit code 1) when anything failed
+#
+# Failures are recorded rather than raised, so one broken case never hides the rest.
+#
+# Exposes the global: Check
+
+class __QSiteCheck {
+    fn init() {
+        self.passed = 0
+        self.failed = 0
+        self.failures = []
+        self.group = ""
+    }
+
+    fn section(name) {
+        self.group = name
+        print("")
+        print(name)
+    }
+
+    fn pass(label) {
+        self.passed += 1
+        print("  ok   " + label)
+    }
+
+    fn failWith(label, detail) {
+        self.failed += 1
+        self.failures.push(self.group + " > " + label)
+        print("  FAIL " + label)
+        if detail != "" { print(detail) }
+    }
+
+    fn eq(label, actual, expected) {
+        if self.same(actual, expected) {
+            self.pass(label)
+        } else {
+            self.failWith(label, "       expected: " + self.show(expected) + "\n       actual:   " + self.show(actual))
+        }
+    }
+
+    fn ok(label, condition) {
+        if condition {
+            self.pass(label)
+        } else {
+            self.failWith(label, "")
+        }
+    }
+
+    fn has(label, text, part) {
+        if type(text) == "string" and text.contains(part) {
+            self.pass(label)
+        } else {
+            self.failWith(label, "       expected to contain: " + self.show(part) + "\n       actual: " + self.show(text))
+        }
+    }
+
+    fn lacks(label, text, part) {
+        if type(text) == "string" and not text.contains(part) {
+            self.pass(label)
+        } else {
+            self.failWith(label, "       expected NOT to contain: " + self.show(part))
+        }
+    }
+
+    fn throws(label, action) {
+        let threw = false
+        try {
+            action()
+        } catch (e) {
+            threw = true
+        }
+        self.ok(label, threw)
+    }
+
+    fn same(a, b) {
+        let ta = type(a)
+        if ta != type(b) { return false }
+        if ta == "array" {
+            if len(a) != len(b) { return false }
+            for k in range(len(a)) {
+                if not self.same(a[k], b[k]) { return false }
+            }
+            return true
+        }
+        if ta == "dict" {
+            if len(a.keys()) != len(b.keys()) { return false }
+            for k in a.keys() {
+                if not (k in b) { return false }
+                if not self.same(a[k], b[k]) { return false }
+            }
+            return true
+        }
+        return a == b
+    }
+
+    fn show(v) {
+        if type(v) == "string" { return "\"" + v.replaceAll("\n", "\\n") + "\"" }
+        if v == null { return "null" }
+        return str(v)
+    }
+
+    fn report() {
+        print("")
+        let total = self.passed + self.failed
+        if self.failed == 0 {
+            print("PASS " + str(self.passed) + " passed, 0 failed, " + str(total) + " total")
+            return
+        }
+        print("FAIL " + str(self.passed) + " passed, " + str(self.failed) + " failed, " + str(total) + " total")
+        for f in self.failures { print("  - " + f) }
+        raise str(self.failed) + " test(s) failed"
+    }
+}
+
+Check = __QSiteCheck()
