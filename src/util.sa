@@ -1,0 +1,515 @@
+# quantum-site / util — text, path, date and file helpers shared by every module
+#
+#   SiteUtil.slugify("Hello, World!")         # "hello-world"
+#   SiteUtil.escapeHtml("<b>&</b>")           # "&lt;b&gt;&amp;&lt;/b&gt;"
+#   SiteUtil.formatDate("2026-11-02", "long") # "2 November 2026"
+#   SiteUtil.listFiles("content")             # ["about.md", "posts/hello.md"]
+#
+# Exposes the global: SiteUtil
+
+class __QSiteUtil {
+    fn init() {
+        self.MONTHS = ["January", "February", "March", "April", "May", "June", "July",
+            "August", "September", "October", "November", "December"]
+        self.MONTHS_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        self.DAYS_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        self.PUNCT = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+    }
+
+    # ── text ─────────────────────────────────────────────────────────────
+
+    fn text(value) {
+        if value == null { return "" }
+        if type(value) == "string" { return value }
+        if type(value) == "number" and value == floor(value) and value > -1e15 and value < 1e15 {
+            return sprintf("%.0f", value)
+        }
+        return str(value)
+    }
+
+    fn escapeHtml(value) {
+        let s = self.text(value)
+        if s == "" { return "" }
+        s = s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
+        return s.replaceAll("\"", "&quot;").replaceAll("'", "&#39;")
+    }
+
+    fn unescapeHtml(value) {
+        let s = self.text(value)
+        s = s.replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&quot;", "\"")
+        return s.replaceAll("&#39;", "'").replaceAll("&amp;", "&")
+    }
+
+    fn isPunct(ch) {
+        return len(ch) == 1 and self.PUNCT.contains(ch)
+    }
+
+    fn isSpace(ch) {
+        return ch == " " or ch == "\t" or ch == "\n" or ch == "\r"
+    }
+
+    fn isWordChar(ch) {
+        if ch == "" or ch == null { return false }
+        return ch.isalnum() or ord(ch) >= 128
+    }
+
+    # Lowercase words joined by "-". Bytes above ASCII (UTF-8 letters) are kept.
+    fn slugify(value) {
+        let s = self.text(value).lower()
+        let out = []
+        let gap = false
+        for i in range(len(s)) {
+            let ch = s[i]
+            if self.isWordChar(ch) {
+                if gap and len(out) > 0 { out.push("-") }
+                out.push(ch)
+                gap = false
+            } else {
+                gap = true
+            }
+        }
+        return out.join("")
+    }
+
+    # "hello-world_again" -> "Hello World Again"
+    fn titleFromSlug(slug) {
+        let words = []
+        for w in self.text(slug).replaceAll("_", "-").split("-") {
+            if w != "" { words.push(w[0].upper() + w.slice(1)) }
+        }
+        return words.join(" ")
+    }
+
+    # Removes <tags>, collapses whitespace and decodes the basic entities.
+    fn stripTags(html) {
+        let s = self.text(html)
+        let out = []
+        let inTag = false
+        let start = 0
+        let tagStart = 0
+        for i in range(len(s)) {
+            let ch = s[i]
+            if inTag {
+                if ch == ">" {
+                    inTag = false
+                    start = i + 1
+                    if self.isBlockTag(s.slice(tagStart + 1, i)) { out.push(" ") }
+                }
+            } else if ch == "<" {
+                if i > start { out.push(s.slice(start, i)) }
+                inTag = true
+                tagStart = i
+            }
+        }
+        if not inTag and start < len(s) { out.push(s.slice(start)) }
+        return self.collapseSpaces(self.unescapeHtml(out.join("")))
+    }
+
+    # True for tags that separate words when removed: p, li, h1-h6, br, td, ...
+    fn isBlockTag(inner) {
+        let t = inner.trim().lower()
+        if t.startsWith("/") { t = t.slice(1) }
+        let k = 0
+        while k < len(t) and t[k].isalnum() { k += 1 }
+        let name = t.slice(0, k)
+        let blocks = ["p", "br", "li", "ul", "ol", "div", "section", "article", "header", "footer", "nav",
+            "h1", "h2", "h3", "h4", "h5", "h6", "pre", "blockquote", "table", "thead", "tbody", "tr",
+            "td", "th", "hr", "img", "dd", "dt", "dl", "figure", "figcaption"]
+        return blocks.contains(name)
+    }
+
+    fn collapseSpaces(s) {
+        let words = []
+        for w in self.words(s) { words.push(w) }
+        return words.join(" ")
+    }
+
+    # Whitespace-separated words.
+    fn words(s) {
+        let out = []
+        let start = -1
+        let n = len(s)
+        for i in range(n) {
+            if self.isSpace(s[i]) {
+                if start >= 0 {
+                    out.push(s.slice(start, i))
+                    start = -1
+                }
+            } else if start < 0 {
+                start = i
+            }
+        }
+        if start >= 0 { out.push(s.slice(start)) }
+        return out
+    }
+
+    fn wordCount(s) {
+        return len(self.words(self.text(s)))
+    }
+
+    fn truncateWords(value, count) {
+        let w = self.words(self.text(value))
+        if len(w) <= count { return w.join(" ") }
+        return w.slice(0, count).join(" ") + "…"
+    }
+
+    fn truncateChars(value, count) {
+        let s = self.text(value)
+        if len(s) <= count { return s }
+        let cut = s.slice(0, count)
+        let space = self.lastIndex(cut, " ")
+        if space > count / 2 { cut = cut.slice(0, space) }
+        return cut.trim() + "…"
+    }
+
+    # Index of `sub` in `s` at or after `start`, or -1.
+    fn indexFrom(s, sub, start) {
+        if start >= len(s) { return -1 }
+        if start <= 0 { return s.indexOf(sub) }
+        let k = s.slice(start).indexOf(sub)
+        if k < 0 { return -1 }
+        return k + start
+    }
+
+    fn lastIndex(s, ch) {
+        let i = len(s) - 1
+        while i >= 0 {
+            if s[i] == ch { return i }
+            i -= 1
+        }
+        return -1
+    }
+
+    # Number of leading spaces (a tab counts as 4).
+    fn indentOf(line) {
+        let n = 0
+        for i in range(len(line)) {
+            if line[i] == " " {
+                n += 1
+            } else if line[i] == "\t" {
+                n += 4
+            } else {
+                return n
+            }
+        }
+        return n
+    }
+
+    # Drops up to `count` columns of leading whitespace.
+    fn dedent(line, count) {
+        let i = 0
+        let removed = 0
+        while i < len(line) and removed < count {
+            if line[i] == " " {
+                removed += 1
+            } else if line[i] == "\t" {
+                removed += 4
+            } else {
+                break
+            }
+            i += 1
+        }
+        return line.slice(i)
+    }
+
+    fn trimEnd(s) {
+        let i = len(s)
+        while i > 0 and self.isSpace(s[i - 1]) { i -= 1 }
+        return s.slice(0, i)
+    }
+
+    fn normalizeNewlines(s) {
+        let t = self.text(s)
+        if len(t) >= 3 and ord(t[0]) == 239 and ord(t[1]) == 187 and ord(t[2]) == 191 {
+            t = t.slice(3)
+        }
+        return t.replaceAll("\r\n", "\n").replaceAll("\r", "\n")
+    }
+
+    fn repeatText(s, count) {
+        let out = []
+        for i in range(count) { out.push(s) }
+        return out.join("")
+    }
+
+    fn pad2(n) {
+        return n < 10 ? "0" + self.text(n) : self.text(n)
+    }
+
+    fn padIndex(n) {
+        let s = self.text(n)
+        while len(s) < 7 { s = "0" + s }
+        return s
+    }
+
+    # Array of strings, sorted (arr.sort() takes no comparator, but sorts strings).
+    fn sortStrings(items) {
+        let copy = []
+        for x in items { copy.push(x) }
+        copy.sort()
+        return copy
+    }
+
+    # Sorts dicts by a text field. Ties keep their original order.
+    fn sortRecords(items, field, descending) {
+        let sep = chr(1)
+        let keys = []
+        for i in range(len(items)) {
+            let v = self.text(items[i].get(field, "")).lower()
+            keys.push(v + sep + self.padIndex(descending ? len(items) - i : i))
+        }
+        keys.sort()
+        let out = []
+        let n = len(keys)
+        for j in range(n) {
+            let key = descending ? keys[n - 1 - j] : keys[j]
+            let idx = num(key.slice(self.lastIndex(key, sep) + 1))
+            out.push(items[descending ? len(items) - idx : idx])
+        }
+        return out
+    }
+
+    fn copyDict(d) {
+        let out = {}
+        if d == null { return out }
+        for k in d.keys() { out[k] = d[k] }
+        return out
+    }
+
+    # Values from `extra` win; dicts are merged one level deep.
+    fn merge(base, extra) {
+        let out = self.copyDict(base)
+        if extra == null { return out }
+        for k in extra.keys() {
+            let v = extra[k]
+            if type(v) == "dict" and type(out.get(k, null)) == "dict" {
+                out[k] = self.merge(out[k], v)
+            } else {
+                out[k] = v
+            }
+        }
+        return out
+    }
+
+    # ── dates ("YYYY-MM-DD", optionally followed by a time) ──────────────
+
+    fn digitsOnly(s) {
+        if s == "" { return false }
+        for i in range(len(s)) {
+            if not s[i].isdigit() { return false }
+        }
+        return true
+    }
+
+    fn parseDate(value) {
+        let s = self.text(value).trim()
+        if len(s) < 10 { return null }
+        let y = s.slice(0, 4)
+        let m = s.slice(5, 7)
+        let d = s.slice(8, 10)
+        if s[4] != "-" or s[7] != "-" { return null }
+        if not self.digitsOnly(y) or not self.digitsOnly(m) or not self.digitsOnly(d) { return null }
+        let month = num(m)
+        let day = num(d)
+        if month < 1 or month > 12 or day < 1 or day > 31 { return null }
+        let clock = "00:00:00"
+        if len(s) >= 16 and (s[10] == " " or s[10] == "T") {
+            clock = s.slice(11, 16) + ":00"
+            if len(s) >= 19 and s[16] == ":" { clock = s.slice(11, 19) }
+        }
+        return {"year": num(y), "month": month, "day": day, "clock": clock}
+    }
+
+    # 0 = Sunday (Sakamoto's method).
+    fn weekday(year, month, day) {
+        let t = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4]
+        let y = year
+        if month < 3 { y -= 1 }
+        return (y + floor(y / 4) - floor(y / 100) + floor(y / 400) + t[month - 1] + day) % 7
+    }
+
+    # style: "long" (2 November 2026), "short" (2 Nov 2026), "iso" (2026-11-02),
+    # "us" (November 2, 2026), "year", "month" (November 2026), "rfc822" (for RSS)
+    fn formatDate(value, style) {
+        let d = self.parseDate(value)
+        if d == null { return self.text(value) }
+        if style == null or style == "" { style = "long" }
+        let y = self.text(d["year"])
+        let mi = d["month"] - 1
+        let day = self.text(d["day"])
+        if style == "short" { return day + " " + self.MONTHS_SHORT[mi] + " " + y }
+        if style == "iso" { return y + "-" + self.pad2(d["month"]) + "-" + self.pad2(d["day"]) }
+        if style == "us" { return self.MONTHS[mi] + " " + day + ", " + y }
+        if style == "year" { return y }
+        if style == "month" { return self.MONTHS[mi] + " " + y }
+        if style == "rfc822" {
+            let wd = self.DAYS_SHORT[self.weekday(d["year"], d["month"], d["day"])]
+            return wd + ", " + self.pad2(d["day"]) + " " + self.MONTHS_SHORT[mi] + " " + y + " " + d["clock"] + " +0000"
+        }
+        return day + " " + self.MONTHS[mi] + " " + y
+    }
+
+    # Today's UTC date as "YYYY-MM-DD", from the Unix clock.
+    fn today() {
+        let secs = 0
+        try {
+            secs = time()
+        } catch (e) {
+            secs = 0
+        }
+        if type(secs) != "number" or secs <= 0 { return "1970-01-01" }
+        let z = floor(secs / 86400) + 719468
+        let era = floor(z / 146097)
+        let doe = z - era * 146097
+        let yoe = floor((doe - floor(doe / 1460) + floor(doe / 36524) - floor(doe / 146096)) / 365)
+        let y = yoe + era * 400
+        let doy = doe - (365 * yoe + floor(yoe / 4) - floor(yoe / 100))
+        let mp = floor((5 * doy + 2) / 153)
+        let d = doy - floor((153 * mp + 2) / 5) + 1
+        let m = mp < 10 ? mp + 3 : mp - 9
+        if m <= 2 { y += 1 }
+        return self.text(y) + "-" + self.pad2(m) + "-" + self.pad2(d)
+    }
+
+    # ── paths (always forward slashes) ───────────────────────────────────
+
+    fn normalizePath(p) {
+        let s = self.text(p).replaceAll("\\", "/")
+        while s.contains("//") { s = s.replaceAll("//", "/") }
+        return s
+    }
+
+    fn joinPath(a, b) {
+        a = self.normalizePath(a)
+        b = self.normalizePath(b)
+        if a == "" or a == "." { return b }
+        if b == "" { return a }
+        if b.startsWith("/") { b = b.slice(1) }
+        if a.endsWith("/") { return a + b }
+        return a + "/" + b
+    }
+
+    fn dirOf(p) {
+        let s = self.normalizePath(p)
+        let i = self.lastIndex(s, "/")
+        if i < 0 { return "" }
+        return s.slice(0, i)
+    }
+
+    fn fileOf(p) {
+        let s = self.normalizePath(p)
+        return s.slice(self.lastIndex(s, "/") + 1)
+    }
+
+    # Lowercase extension with the dot, e.g. ".md", or "".
+    fn extOf(p) {
+        let name = self.fileOf(p)
+        let i = self.lastIndex(name, ".")
+        if i <= 0 { return "" }
+        return name.slice(i).lower()
+    }
+
+    fn stripExt(p) {
+        let s = self.normalizePath(p)
+        let ext = self.extOf(s)
+        if ext == "" { return s }
+        return s.slice(0, len(s) - len(ext))
+    }
+
+    # "../" once per folder in a site-relative path: "posts/a.html" -> "../"
+    fn rootPrefix(relPath) {
+        let depth = 0
+        let s = self.normalizePath(relPath)
+        for i in range(len(s)) {
+            if s[i] == "/" { depth += 1 }
+        }
+        return self.repeatText("../", depth)
+    }
+
+    # qrun stops a script after 200 million VM steps (a guard for the online
+    # playground). Big sites need more, so builds lift it through the runtime hook
+    # the C++ front-end uses. Side effect: x / 0 gives Infinity instead of raising.
+    fn liftStepLimit() {
+        let lifted = false
+        try {
+            __cpp_runtime__()
+            lifted = true
+        } catch (e) {
+            lifted = false
+        }
+        return lifted
+    }
+
+    # ── files ────────────────────────────────────────────────────────────
+
+    fn readText(path) {
+        let content = read_file(path)
+        if content == null { raise "cannot read " + path }
+        return content
+    }
+
+    fn writeText(path, content) {
+        self.ensureDir(self.dirOf(path))
+        if not write_file(path, content) {
+            raise "cannot write " + path
+        }
+        return true
+    }
+
+    # Creates a folder and its parents. Uses the VM's create_directories native.
+    fn ensureDir(path) {
+        let p = self.normalizePath(path)
+        if p == "" or p == "." { return true }
+        if p.endsWith("/") { p = p.slice(0, len(p) - 1) }
+        if os.path.isdir(p) { return true }
+        let made = false
+        try {
+            made = __q_fs_mkdirs(p)
+        } catch (e) {
+            made = false
+        }
+        if os.path.isdir(p) { return true }
+        raise "cannot create folder " + p + " (create it by hand, or update qrun)"
+    }
+
+    # Copies a file byte for byte (falls back to read + write).
+    fn copyFile(source, target) {
+        self.ensureDir(self.dirOf(target))
+        let copied = false
+        try {
+            copied = __q_fs_copy(source, target, true)
+        } catch (e) {
+            copied = false
+        }
+        if copied == true { return true }
+        let data = read_file(source)
+        if data == null { raise "cannot read " + source }
+        if not write_file(target, data) { raise "cannot write " + target }
+        return true
+    }
+
+    # Every file below `root`, as sorted paths relative to it ("posts/a.md").
+    # Names starting with "." are skipped.
+    fn listFiles(root) {
+        let out = []
+        if not os.path.isdir(root) { return out }
+        self.collectFiles(root, "", out)
+        return self.sortStrings(out)
+    }
+
+    fn collectFiles(root, rel, out) {
+        let here = rel == "" ? root : self.joinPath(root, rel)
+        let names = os.listdir(here)
+        for name in names {
+            if name.startsWith(".") { continue }
+            let childRel = rel == "" ? name : rel + "/" + name
+            if os.path.isdir(self.joinPath(root, childRel)) {
+                self.collectFiles(root, childRel, out)
+            } else {
+                out.push(childRel)
+            }
+        }
+    }
+}
+
+SiteUtil = __QSiteUtil()
