@@ -1,0 +1,208 @@
+# quantum-site / frontmatter — the "---" metadata block at the top of a page
+#
+#   let doc = FrontMatter.parse("---\ntitle: Hello\ntags: [news, quantum]\n---\nBody text")
+#   doc["data"]["title"]     # "Hello"
+#   doc["data"]["tags"]      # ["news", "quantum"]
+#   doc["body"]              # "Body text"
+#
+# A small YAML subset: `key: value` lines, quoted strings, numbers, true/false/null,
+# inline lists `[a, b]`, block lists (`- item` lines under `key:`) and one level of
+# nested `key:` maps. Lines starting with # are comments.
+#
+# Exposes the global: FrontMatter
+
+# @use ./util.sa
+
+class __QFrontMatter {
+    fn init() {}
+
+    fn parse(text) {
+        let src = SiteUtil.normalizeNewlines(text)
+        if not (src.startsWith("---\n") or src == "---") {
+            return {"data": {}, "body": src}
+        }
+        let lines = src.split("\n")
+        let end = -1
+        for k in range(1, len(lines)) {
+            let t = SiteUtil.trimEnd(lines[k])
+            if t == "---" or t == "..." {
+                end = k
+                break
+            }
+        }
+        if end < 0 { return {"data": {}, "body": src} }
+        let data = self.parseLines(lines.slice(1, end))
+        let body = lines.slice(end + 1).join("\n")
+        if body.startsWith("\n") { body = body.slice(1) }
+        return {"data": data, "body": body}
+    }
+
+    # Renders a dict back to a front matter block (used by the `new` command).
+    fn stringify(data, keys) {
+        let lines = ["---"]
+        for k in keys {
+            if k in data { lines.push(k + ": " + self.valueText(data[k])) }
+        }
+        lines.push("---")
+        return lines.join("\n") + "\n"
+    }
+
+    fn valueText(v) {
+        if type(v) == "array" {
+            let parts = []
+            for x in v { parts.push(self.valueText(x)) }
+            return "[" + parts.join(", ") + "]"
+        }
+        if type(v) == "string" {
+            if v == "" or v.contains(":") or v.contains("#") or v.startsWith("[") or v.startsWith("\"") {
+                return "\"" + v.replaceAll("\"", "\\\"") + "\""
+            }
+            return v
+        }
+        return SiteUtil.text(v)
+    }
+
+    fn parseLines(lines) {
+        let data = {}
+        let i = 0
+        let n = len(lines)
+        while i < n {
+            let line = lines[i]
+            let t = line.trim()
+            if t == "" or t.startsWith("#") or SiteUtil.indentOf(line) > 0 {
+                i += 1
+                continue
+            }
+            let colon = t.indexOf(":")
+            if colon <= 0 {
+                i += 1
+                continue
+            }
+            let key = t.slice(0, colon).trim()
+            let rest = t.slice(colon + 1).trim()
+            i += 1
+            if rest != "" {
+                data[key] = self.parseValue(rest)
+                continue
+            }
+            # block list or nested map under this key
+            let items = []
+            let nested = {}
+            let isMap = false
+            while i < n and (lines[i].trim() == "" or SiteUtil.indentOf(lines[i]) > 0 or lines[i].trim().startsWith("- ")) {
+                let sub = lines[i].trim()
+                i += 1
+                if sub == "" or sub.startsWith("#") { continue }
+                if sub.startsWith("- ") or sub == "-" {
+                    items.push(self.parseValue(sub.slice(1).trim()))
+                } else {
+                    let c = sub.indexOf(":")
+                    if c > 0 {
+                        nested[sub.slice(0, c).trim()] = self.parseValue(sub.slice(c + 1).trim())
+                        isMap = true
+                    }
+                }
+            }
+            if isMap {
+                data[key] = nested
+            } else if len(items) > 0 {
+                data[key] = items
+            } else {
+                data[key] = ""
+            }
+        }
+        return data
+    }
+
+    fn parseValue(raw) {
+        let s = raw.trim()
+        if s == "" { return "" }
+        let q = s[0]
+        if (q == "\"" or q == "'") and len(s) >= 2 {
+            let close = self.closingQuote(s, q)
+            if close > 0 {
+                let inner = s.slice(1, close)
+                if q == "\"" { inner = inner.replaceAll("\\\"", "\"").replaceAll("\\n", "\n") }
+                if q == "'" { inner = inner.replaceAll("''", "'") }
+                return inner
+            }
+        }
+        # trailing comment
+        let hash = s.indexOf(" #")
+        if hash > 0 { s = s.slice(0, hash).trim() }
+        if s.startsWith("[") and s.endsWith("]") {
+            let out = []
+            for part in self.listParts(s.slice(1, len(s) - 1)) {
+                if part.trim() != "" { out.push(self.parseValue(part)) }
+            }
+            return out
+        }
+        let low = s.lower()
+        if low == "true" or low == "yes" { return true }
+        if low == "false" or low == "no" { return false }
+        if low == "null" or low == "~" { return null }
+        if self.looksNumeric(s) { return num(s) }
+        return s
+    }
+
+    fn closingQuote(s, q) {
+        let k = 1
+        while k < len(s) {
+            if s[k] == "\\" and q == "\"" {
+                k += 2
+                continue
+            }
+            if s[k] == q {
+                if q == "'" and k + 1 < len(s) and s[k + 1] == "'" {
+                    k += 2
+                    continue
+                }
+                return k
+            }
+            k += 1
+        }
+        return -1
+    }
+
+    # Comma-separated items, ignoring commas inside quotes.
+    fn listParts(s) {
+        let parts = []
+        let cur = []
+        let quote = ""
+        for k in range(len(s)) {
+            let c = s[k]
+            if quote != "" {
+                cur.push(c)
+                if c == quote { quote = "" }
+            } else if c == "\"" or c == "'" {
+                quote = c
+                cur.push(c)
+            } else if c == "," {
+                parts.push(cur.join(""))
+                cur = []
+            } else {
+                cur.push(c)
+            }
+        }
+        parts.push(cur.join(""))
+        return parts
+    }
+
+    fn looksNumeric(s) {
+        if s == "" or len(s) > 15 { return false }
+        let first = (s[0] == "-" or s[0] == "+") ? 1 : 0
+        if first == len(s) { return false }
+        let dots = 0
+        for k in range(first, len(s)) {
+            if s[k] == "." {
+                dots += 1
+            } else if not s[k].isdigit() {
+                return false
+            }
+        }
+        if len(s) - first > 1 and s[first] == "0" and s[first + 1] != "." { return false }
+        return dots <= 1
+    }
+}
+
+FrontMatter = __QFrontMatter()
