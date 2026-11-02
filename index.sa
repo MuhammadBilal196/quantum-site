@@ -1,0 +1,24 @@
+# quantum-site — a static site generator for the Quantum language
+#
+# Turns a folder of Markdown pages, Handlebars-style layouts and static files into a
+# complete website: blog with tags and archive, RSS feed, sitemap, relative links that
+# work on GitHub Pages or straight from disk.
+#
+#   Global        Module              What it does
+#   ────────────  ──────────────────  ──────────────────────────────────────────────
+#   SiteUtil      src/util.sa         slugify, escaping, dates, paths, file helpers
+#   FrontMatter   src/frontmatter.sa  "---" metadata blocks (YAML subset)
+#   Markdown      src/markdown.sa     Markdown -> HTML, headings, table of contents
+#   Template      src/template.sa     {{ }} templates: if/each/with, partials, filters
+#   Site          src/site.sa         builds content/ + layouts/ + static/ -> public/
+#   SiteStarter   src/starter.sa      the starter site written by `init`
+#
+# Bundle entry: lists the modules in dependency order. Use it with `# @use quantum-site`
+# and quantum-bundle, or run the pre-bundled single files in dist/.
+
+# @use ./src/util.sa
+# @use ./src/frontmatter.sa
+# @use ./src/markdown.sa
+# @use ./src/template.sa
+# @use ./src/site.sa
+# @use ./src/starter.sa
