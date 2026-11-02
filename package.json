@@ -1,0 +1,49 @@
+{
+  "name": "quantum-site",
+  "version": "1.0.0",
+  "description": "Static site generator for Quantum: Markdown pages and blog posts, Handlebars-style layouts, tags, archive, RSS feed and sitemap, in one command.",
+  "main": "index.sa",
+  "bin": {
+    "quantum-site": "dist/quantum-site-cli.sa"
+  },
+  "keywords": [
+    "quantum",
+    "sa",
+    "static-site",
+    "markdown",
+    "blog",
+    "template",
+    "html",
+    "website"
+  ],
+  "author": "Muhammad Bilal Raza",
+  "license": "MIT",
+  "files": [
+    "index.sa",
+    "src/",
+    "bin/",
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "qrun dist/quantum-site-cli.sa",
+    "build": "qrun dist/quantum-site-cli.sa build",
+    "test": "qrun test/run-tests.sa"
+  },
+  "quantum": {
+    "bundles": [
+      { "entry": "index.sa", "out": "dist/quantum-site.sa" },
+      { "entry": "bin/quantum-site.sa", "out": "dist/quantum-site-cli.sa" },
+      { "entry": "test/all.test.sa", "out": "test/run-tests.sa" }
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GITHUB_USERNAME/quantum-site.git"
+  },
+  "bugs": {
+    "url": "https://github.com/GITHUB_USERNAME/quantum-site/issues"
+  },
+  "homepage": "https://github.com/GITHUB_USERNAME/quantum-site#readme"
+}
