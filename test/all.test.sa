@@ -1,0 +1,205 @@
+# quantum-site test suite
+#
+#   qrun test/run-tests.sa        (run from the package folder)
+#
+# test/run-tests.sa is this file bundled with the library and the harness.
+
+# @use ./harness.sa
+# @use ../index.sa
+
+# ── SiteUtil ─────────────────────────────────────────────────────────────
+
+Check.section("SiteUtil")
+Check.eq("slugify joins words with dashes", SiteUtil.slugify("Hello, World! 2026"), "hello-world-2026")
+Check.eq("slugify trims separators", SiteUtil.slugify("  --Quantum   Site--  "), "quantum-site")
+Check.eq("escapeHtml escapes the five characters", SiteUtil.escapeHtml("<a href=\"x\">'&'</a>"), "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;")
+Check.eq("unescapeHtml reverses escapeHtml", SiteUtil.unescapeHtml(SiteUtil.escapeHtml("a < b & \"c\"")), "a < b & \"c\"")
+Check.eq("stripTags keeps inline words together", SiteUtil.stripTags("<p>Use <code>qrun</code> now</p><p>Next</p>"), "Use qrun now Next")
+Check.eq("titleFromSlug", SiteUtil.titleFromSlug("hello-world_again"), "Hello World Again")
+Check.eq("truncateWords adds an ellipsis", SiteUtil.truncateWords("one two three four", 2), "one two…")
+Check.eq("formatDate long", SiteUtil.formatDate("2026-11-02", "long"), "2 November 2026")
+Check.eq("formatDate defaults to long", SiteUtil.formatDate("2026-11-02", null), "2 November 2026")
+Check.eq("formatDate us", SiteUtil.formatDate("2026-03-09", "us"), "March 9, 2026")
+Check.eq("formatDate rfc822 has the weekday", SiteUtil.formatDate("2026-11-02 14:30", "rfc822"), "Mon, 02 Nov 2026 14:30:00 +0000")
+Check.eq("formatDate leaves non-dates alone", SiteUtil.formatDate("soon", "long"), "soon")
+Check.eq("parseDate rejects bad months", SiteUtil.parseDate("2026-13-01"), null)
+Check.ok("today looks like a date", SiteUtil.parseDate(SiteUtil.today()) != null)
+Check.eq("joinPath", SiteUtil.joinPath("public/", "/posts/a.html"), "public/posts/a.html")
+Check.eq("dirOf / fileOf / extOf", [SiteUtil.dirOf("a/b/c.md"), SiteUtil.fileOf("a/b/c.md"), SiteUtil.extOf("a/b/C.MD")], ["a/b", "c.md", ".md"])
+Check.eq("stripExt", SiteUtil.stripExt("posts/hello.world.md"), "posts/hello.world")
+Check.eq("rootPrefix counts folders", [SiteUtil.rootPrefix("index.html"), SiteUtil.rootPrefix("posts/a.html"), SiteUtil.rootPrefix("a/b/c.html")], ["", "../", "../../"])
+let records = [{"t": "b", "d": "2026-01-02"}, {"t": "a", "d": "2026-03-01"}, {"t": "c", "d": "2026-01-02"}]
+let byDate = SiteUtil.sortRecords(records, "d", true)
+Check.eq("sortRecords descending keeps ties in order", [byDate[0]["t"], byDate[1]["t"], byDate[2]["t"]], ["a", "b", "c"])
+let byTitle = SiteUtil.sortRecords(records, "t", false)
+Check.eq("sortRecords ascending", [byTitle[0]["t"], byTitle[1]["t"], byTitle[2]["t"]], ["a", "b", "c"])
+Check.eq("merge is one level deep", SiteUtil.merge({"a": 1, "p": {"x": 1, "y": 2}}, {"p": {"y": 3}}), {"a": 1, "p": {"x": 1, "y": 3}})
+
+# ── FrontMatter ──────────────────────────────────────────────────────────
+
+Check.section("FrontMatter")
+let fm = FrontMatter.parse("---\ntitle: \"Hello: World\"\ndate: 2026-11-02\ndraft: false\norder: 3\ntags: [news, \"a, b\"]\nauthors:\n  - Ada\n  - Linus\nauthor:\n  name: Ada\n  site: https://ada.dev\n# comment\n---\n\nBody **text**\n")
+Check.eq("quoted string with a colon", fm["data"]["title"], "Hello: World")
+Check.eq("dates stay text", fm["data"]["date"], "2026-11-02")
+Check.eq("booleans", fm["data"]["draft"], false)
+Check.eq("numbers", fm["data"]["order"], 3)
+Check.eq("inline list with a quoted comma", fm["data"]["tags"], ["news", "a, b"])
+Check.eq("block list", fm["data"]["authors"], ["Ada", "Linus"])
+Check.eq("nested map", fm["data"]["author"], {"name": "Ada", "site": "https://ada.dev"})
+Check.eq("body after the block", fm["body"], "Body **text**\n")
+Check.eq("no front matter", FrontMatter.parse("# Just text"), {"data": {}, "body": "# Just text"})
+Check.eq("CRLF line endings", FrontMatter.parse("---\r\ntitle: Win\r\n---\r\nHi")["data"]["title"], "Win")
+Check.eq("unclosed block is body", FrontMatter.parse("---\ntitle: x\n")["data"], {})
+Check.eq("stringify round trip", FrontMatter.parse(FrontMatter.stringify({"title": "A: B", "tags": ["x", "y"]}, ["title", "tags"]))["data"], {"title": "A: B", "tags": ["x", "y"]})
+
+# ── Markdown: blocks ─────────────────────────────────────────────────────
+
+Check.section("Markdown blocks")
+Check.eq("heading with id", Markdown.render("# Hello World"), "<h1 id=\"hello-world\">Hello World</h1>")
+Check.eq("closing hashes are dropped", Markdown.render("## Install ##"), "<h2 id=\"install\">Install</h2>")
+Check.eq("duplicate heading ids get numbers", Markdown.render("## A\n## A\n## A"), "<h2 id=\"a\">A</h2>\n<h2 id=\"a-1\">A</h2>\n<h2 id=\"a-2\">A</h2>")
+Check.eq("#hashtag is not a heading", Markdown.render("#tag"), "<p>#tag</p>")
+Check.eq("paragraphs", Markdown.render("one\ntwo\n\nthree"), "<p>one\ntwo</p>\n<p>three</p>")
+Check.eq("hard break with two spaces", Markdown.render("a  \nb"), "<p>a<br>\nb</p>")
+Check.eq("hard break with a backslash", Markdown.render("a\\\nb"), "<p>a<br>\nb</p>")
+Check.eq("fenced code is escaped", Markdown.render("```js\nif (a < b) {}\n```"), "<pre><code class=\"language-js\">if (a &lt; b) {}\n</code></pre>")
+Check.eq("tilde fence", Markdown.render("~~~\nx\n~~~"), "<pre><code>x\n</code></pre>")
+Check.eq("indented code", Markdown.render("    let x = 1\n    print(x)"), "<pre><code>let x = 1\nprint(x)\n</code></pre>")
+Check.eq("horizontal rules", Markdown.render("---\n***\n_ _ _"), "<hr>\n<hr>\n<hr>")
+Check.eq("block quote", Markdown.render("> quoted *text*\n> more"), "<blockquote>\n<p>quoted <em>text</em>\nmore</p>\n</blockquote>")
+Check.eq("tight list", Markdown.render("- a\n- b"), "<ul>\n<li>a</li>\n<li>b</li>\n</ul>")
+Check.eq("loose list", Markdown.render("- a\n\n- b"), "<ul>\n<li><p>a</p></li>\n<li><p>b</p></li>\n</ul>")
+Check.eq("nested list", Markdown.render("- a\n  - b\n- c"), "<ul>\n<li>a\n<ul>\n<li>b</li>\n</ul></li>\n<li>c</li>\n</ul>")
+Check.eq("ordered list with a start", Markdown.render("3. x\n4. y"), "<ol start=\"3\">\n<li>x</li>\n<li>y</li>\n</ol>")
+Check.eq("task list", Markdown.render("- [x] done\n- [ ] todo"), "<ul class=\"task-list\">\n<li class=\"task-list-item\"><input type=\"checkbox\" disabled checked> done</li>\n<li class=\"task-list-item\"><input type=\"checkbox\" disabled> todo</li>\n</ul>")
+Check.eq("lazy list continuation", Markdown.render("- a\ncontinued"), "<ul>\n<li>a\ncontinued</li>\n</ul>")
+Check.eq("table with alignment", Markdown.render("| a | b |\n|:--|--:|\n| 1 | `x|y` |"), "<table>\n<thead>\n<tr>\n<th style=\"text-align:left\">a</th>\n<th style=\"text-align:right\">b</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td style=\"text-align:left\">1</td>\n<td style=\"text-align:right\"><code>x|y</code></td>\n</tr>\n</tbody>\n</table>")
+Check.eq("raw HTML block passes through", Markdown.render("<div class=\"note\">\n<b>hi</b>\n</div>"), "<div class=\"note\">\n<b>hi</b>\n</div>")
+Check.eq("empty input", Markdown.render(""), "")
+
+# ── Markdown: inline ─────────────────────────────────────────────────────
+
+Check.section("Markdown inline")
+let il = fn(s) { return Markdown.renderInline(s) }
+Check.eq("strong and em", il("**b** *i* __b__ _i_"), "<strong>b</strong> <em>i</em> <strong>b</strong> <em>i</em>")
+Check.eq("strong em", il("***both***"), "<em><strong>both</strong></em>")
+Check.eq("em inside strong", il("**a *b* c**"), "<strong>a <em>b</em> c</strong>")
+Check.eq("strikethrough", il("~~gone~~"), "<del>gone</del>")
+Check.eq("snake_case stays text", il("use snake_case_names here"), "use snake_case_names here")
+Check.eq("lone stars stay text", il("2 * 3 * 4"), "2 * 3 * 4")
+Check.eq("code span escapes", il("`<b>` and ``a`b``"), "<code>&lt;b&gt;</code> and <code>a`b</code>")
+Check.eq("text is escaped", il("a < b & c"), "a &lt; b &amp; c")
+Check.eq("backslash escapes", il("\\*not em\\*"), "*not em*")
+Check.eq("link with title", il("[Quantum](https://q.dev \"The site\")"), "<a href=\"https://q.dev\" title=\"The site\">Quantum</a>")
+Check.eq("link text is inline markdown", il("[**bold** link](a.html)"), "<a href=\"a.html\"><strong>bold</strong> link</a>")
+Check.eq("image", il("![A cat](cat.png)"), "<img src=\"cat.png\" alt=\"A cat\">")
+Check.eq("autolink", il("<https://x.dev/a?b=1&c=2>"), "<a href=\"https://x.dev/a?b=1&amp;c=2\">https://x.dev/a?b=1&amp;c=2</a>")
+Check.eq("email autolink", il("<me@x.dev>"), "<a href=\"mailto:me@x.dev\">me@x.dev</a>")
+Check.eq("bare URL, trailing dot left out", il("see https://x.dev/page."), "see <a href=\"https://x.dev/page\">https://x.dev/page</a>.")
+Check.eq("inline HTML passes through", il("a <kbd>Ctrl</kbd> b"), "a <kbd>Ctrl</kbd> b")
+Check.eq("unclosed bracket stays text", il("[not a link"), "[not a link")
+Check.eq("reference links", Markdown.render("See [the docs][d] and [d].\n\n[d]: https://docs.dev \"Docs\""), "<p>See <a href=\"https://docs.dev\" title=\"Docs\">the docs</a> and <a href=\"https://docs.dev\" title=\"Docs\">d</a>.</p>")
+
+Check.section("Markdown headings and toc")
+let doc = "# Title\n\n## Install\n\n```\n## not a heading\n```\n\n### From `qpm`\n\n## Install"
+Check.eq("headings skip code blocks", Markdown.headings(doc), [
+    {"level": 1, "text": "Title", "id": "title"},
+    {"level": 2, "text": "Install", "id": "install"},
+    {"level": 3, "text": "From qpm", "id": "from-qpm"},
+    {"level": 2, "text": "Install", "id": "install-1"}
+])
+Check.has("toc links h2 and h3", Markdown.toc(doc, 2, 3), "<li class=\"toc-h3\"><a href=\"#from-qpm\">From qpm</a></li>")
+Check.eq("toc is empty without headings", Markdown.toc("text", 2, 3), "")
+
+# ── Template ─────────────────────────────────────────────────────────────
+
+Check.section("Template")
+let data = {
+    "site": {"title": "Q & A", "posts": [{"title": "One", "tags": ["a"]}, {"title": "Two", "tags": []}]},
+    "page": {"title": "<Hi>", "root": "../", "count": 2, "empty": [], "author": {"name": "Ada"}}
+}
+let r = fn(tpl) { return Template.render(tpl, data) }
+Check.eq("values are escaped", r("{{ page.title }}|{{ site.title }}"), "&lt;Hi&gt;|Q &amp; A")
+Check.eq("triple braces are raw", r("{{{ page.title }}}"), "<Hi>")
+Check.eq("missing values are empty", r("[{{ page.nothing.deeper }}]"), "[]")
+Check.eq("filters chain", r("{{ site.title | lower | replace \"&\" \"and\" }}"), "q and a")
+Check.eq("default filter", r("{{ page.nothing | default \"none\" }}"), "none")
+Check.eq("default with a path", r("{{ page.nothing | default site.title }}"), "Q &amp; A")
+Check.eq("date filter", Template.render("{{ d | date \"short\" }}", {"d": "2026-11-02"}), "2 Nov 2026")
+Check.eq("if / else", r("{{#if page.empty}}yes{{else}}no{{/if}}"), "no")
+Check.eq("else if", r("{{#if page.empty}}a{{else if page.count}}b{{else}}c{{/if}}"), "b")
+Check.eq("unless", r("{{#unless page.empty}}none{{/unless}}"), "none")
+Check.eq("== and !=", r("{{#if page.count == 2}}two{{/if}}{{#if page.title != \"x\"}}!{{/if}}"), "two!")
+Check.eq("and / or / not", r("{{#if page.count and not page.empty}}A{{/if}}{{#if page.empty or page.count}}B{{/if}}"), "AB")
+Check.eq("each with @index, @first, @last", r("{{#each site.posts}}{{ @index }}:{{ title }}{{#if @first}}^{{/if}}{{#if @last}}${{/if}} {{/each}}"), "0:One^ 1:Two$ ")
+Check.eq("each ... as alias", r("{{#each site.posts as post}}{{ post.title }}/{{ page.count }} {{/each}}"), "One/2 Two/2 ")
+Check.eq("each else", r("{{#each page.empty}}x{{else}}empty{{/each}}"), "empty")
+Check.eq("outer names are visible inside each", r("{{#each site.posts}}{{ site.title }}{{/each}}"), "Q &amp; AQ &amp; A")
+Check.eq("each over a dict is sorted by key", Template.render("{{#each d}}{{ @key }}={{ this }};{{/each}}", {"d": {"b": 2, "a": 1}}), "a=1;b=2;")
+Check.eq("with", r("{{#with page.author}}{{ name }}{{/with}}"), "Ada")
+Check.eq("length, join, first", r("{{ site.posts | length }} {{ site.posts.first.title }} {{ site.posts.length }}"), "2 One 2")
+Check.eq("where filter", r("{{#each site.posts | where \"tags\" \"a\"}}{{ title }}{{/each}}"), "One")
+Check.eq("limit and reverse", r("{{#each site.posts | reverse | limit 1}}{{ title }}{{/each}}"), "Two")
+Check.eq("plural", r("{{ page.count | plural \"post\" \"posts\" }}"), "posts")
+Check.eq("rel adds the page root", r("{{ \"posts/a.html\" | rel }} {{ \"https://x.dev\" | rel }} {{ \"index.html\" | rel }}"), "../posts/a.html https://x.dev ../index.html")
+Check.eq("comments vanish", r("a{{! hidden }}b"), "ab")
+Check.eq("escaped braces", r("\\{{ page.title }}"), "{{ page.title }}")
+Check.eq("~ trims whitespace", r("<b>  {{~ page.count ~}}  </b>"), "<b>2</b>")
+Template.registerPartial("card", "[{{ title }}]")
+Check.eq("partials see the current context", r("{{#each site.posts}}{{> card}}{{/each}}"), "[One][Two]")
+Check.eq("partials with an explicit context", r("{{> card site.posts.first}}"), "[One]")
+Template.addFilter("shout", fn(v, args) { return str(v).upper() + "!" })
+Check.eq("custom filters", r("{{ page.author.name | shout }}"), "ADA!")
+Check.throws("unknown filter raises", fn() { Template.render("{{ x | nope }}", {}) })
+Check.throws("unclosed block raises", fn() { Template.render("{{#if x}}open", {}) })
+Check.throws("mismatched close raises", fn() { Template.render("{{#if x}}{{/each}}", {}) })
+Check.throws("unknown partial raises", fn() { Template.render("{{> missing}}", {}) })
+
+# ── Site: build the starter site end to end ──────────────────────────────
+
+Check.section("Site build")
+let root = "build/test-site"
+let made = SiteStarter.create(root, {"title": "Test Blog"})
+Check.ok("starter files are written", len(made["created"]) + len(made["skipped"]) == len(SiteStarter.paths()))
+let again = SiteStarter.create(root, {})
+Check.eq("init never overwrites", len(again["created"]), 0)
+write_file(root + "/content/posts/2026-11-03-draft.md", "---\ntitle: Secret\ndraft: true\n---\nnot yet")
+write_file(root + "/content/notes.html", "---\ntitle: Notes\n---\n<p>{{ site.postCount }} posts on {{ site.title }}</p>")
+let report = Site.build({"root": root, "config": {"baseUrl": "https://me.github.io/blog/"}})
+let out = root + "/public"
+Check.eq("counts posts and tags", [report["posts"], report["tags"]], [2, 3])
+Check.ok("no warnings with a baseUrl", len(report["warnings"]) == 0)
+for f in ["index.html", "about.html", "notes.html", "archive.html", "404.html", "feed.xml", "sitemap.xml", "style.css",
+          "posts/welcome.html", "posts/markdown-cheatsheet.html", "tags/index.html", "tags/quantum.html", ".nojekyll"] {
+    Check.ok("writes " + f, os.path.exists(out + "/" + f))
+}
+Check.ok("drafts are skipped", not os.path.exists(out + "/posts/draft.html"))
+let home = read_file(out + "/index.html")
+Check.has("home uses the configured title", home, "<title>Test Blog</title>")
+Check.has("home lists the newest post first", home, "Markdown cheat sheet")
+Check.ok("posts are newest first", home.indexOf("Markdown cheat sheet") < home.indexOf("Welcome to your new site"))
+Check.has("home marks the active nav item", home, "<a href=\"index.html\" class=\"active\">Home</a>")
+let post = read_file(out + "/posts/welcome.html")
+Check.has("post links are relative to its folder", post, "href=\"../style.css\"")
+Check.has("post has tag links", post, "<a class=\"tag\" href=\"../tags/quantum.html\">#quantum</a>")
+Check.has("post links to the newer post", post, "Markdown cheat sheet →")
+Check.has("post renders markdown", post, "<h2 id=\"writing-a-post\">Writing a post</h2>")
+Check.has("html pages are templates", read_file(out + "/notes.html"), "<p>2 posts on Test Blog</p>")
+let feed = read_file(out + "/feed.xml")
+Check.has("feed has absolute links", feed, "<link>https://me.github.io/blog/posts/welcome.html</link>")
+Check.has("feed dates are RFC 822", feed, "<pubDate>Sun, 01 Nov 2026 00:00:00 +0000</pubDate>")
+Check.has("sitemap lists pages", read_file(out + "/sitemap.xml"), "<loc>https://me.github.io/blog/about.html</loc>")
+Check.lacks("sitemap leaves out 404", read_file(out + "/sitemap.xml"), "404.html")
+write_file(root + "/content/me.md", "---\npermalink: /about/me/\n---\n# Me\r\n\r\nWindows *line* endings\r\n")
+write_file(root + "/content/raw.md", "---\nlayout: none\n---\nJust **this**")
+Site.build({"root": root})
+let me = read_file(out + "/about/me/index.html")
+Check.has("permalink sets the output path", me, "<h1>Me</h1>")
+Check.has("CRLF markdown renders", me, "<p>Windows <em>line</em> endings</p>")
+Check.has("permalink pages link back with ../../", me, "href=\"../../style.css\"")
+Check.eq("layout: none writes bare content", read_file(out + "/raw.html"), "<p>Just <strong>this</strong></p>")
+let withDrafts = Site.build({"root": root, "drafts": true, "outDir": "public-drafts"})
+Check.eq("--drafts includes drafts", withDrafts["posts"], 3)
+Check.throws("a missing content folder raises", fn() { Site.build({"root": "build/no-such-site"}) })
+
+Check.report()
