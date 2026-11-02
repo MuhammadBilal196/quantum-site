@@ -1,0 +1,712 @@
+# quantum-site / template — a Handlebars-style template engine
+#
+#   Template.render("<h1>{{ title | upper }}</h1>", {"title": "hi"})   # <h1>HI</h1>
+#
+#   {{ page.title }}              value, HTML-escaped
+#   {{{ content }}}               value, raw (no escaping)
+#   {{ post.date | date "short" }} filters, chained with |
+#   {{#if page.tags}} ... {{else if page.draft}} ... {{else}} ... {{/if}}
+#   {{#unless page.hideTitle}} ... {{/unless}}
+#   {{#each site.posts}} {{ @index }} {{ this.title }} or {{ title }} {{else}} none {{/each}}
+#   {{#each site.posts as post}} {{ post.title }} {{/each}}
+#   {{#with page.author}} {{ name }} {{/with}}
+#   {{#if page.layout == "post"}} ... {{/if}}      == != and `not` in conditions
+#   {{> header}}  {{> card post}}                  partials (optionally with a new context)
+#   {{! a comment }}   \{{ literal braces   {{~ trims whitespace ~}}
+#
+# Inside #each: @index (from 0), @number (from 1), @first, @last, @key (dicts).
+# @root is the data passed to render(). Names are looked up from the innermost
+# context outwards, so {{ site.title }} works inside any block.
+#
+# Exposes the global: Template
+
+# @use ./util.sa
+# @use ./markdown.sa
+
+class __QTemplate {
+    fn init() {
+        self.partials = {}
+        self.custom = {}
+        self.MAX_DEPTH = 40
+    }
+
+    # ── public API ───────────────────────────────────────────────────────
+
+    fn render(source, data) {
+        return self.renderCompiled(self.compile(source, "template"), data)
+    }
+
+    fn compile(source, name) {
+        if name == null { name = "template" }
+        let src = SiteUtil.normalizeNewlines(source)
+        let tokens = self.tokenize(src, name)
+        return {"name": name, "nodes": self.parseTokens(tokens, src, name)}
+    }
+
+    fn renderCompiled(compiled, data) {
+        if data == null { data = {} }
+        let scopes = [{"ctx": data, "locals": {}}]
+        let out = []
+        self.renderNodes(compiled["nodes"], scopes, out, 0, compiled["name"])
+        return out.join("")
+    }
+
+    fn registerPartial(name, source) {
+        self.partials[name] = self.compile(source, "partial " + name)
+    }
+
+    fn hasPartial(name) {
+        return name in self.partials
+    }
+
+    fn clearPartials() {
+        self.partials = {}
+    }
+
+    # fn(value, args) -> new value. Used as {{ x | name arg1 arg2 }}.
+    fn addFilter(name, handler) {
+        self.custom[name] = handler
+    }
+
+    # ── tokenizer ────────────────────────────────────────────────────────
+
+    fn tokenize(src, name) {
+        let tokens = []
+        let pos = 0
+        let n = len(src)
+        let trimNext = false
+        while pos < n {
+            let openAt = SiteUtil.indexFrom(src, "{{", pos)
+            if openAt < 0 {
+                self.pushText(tokens, src.slice(pos), trimNext)
+                break
+            }
+            # \{{ -> literal {{
+            if openAt > 0 and src[openAt - 1] == "\\" {
+                self.pushText(tokens, src.slice(pos, openAt - 1) + "{{", trimNext)
+                trimNext = false
+                pos = openAt + 2
+                continue
+            }
+            let rawTag = openAt + 2 < n and src[openAt + 2] == "{"
+            let closer = rawTag ? "}}}" : "}}"
+            let bodyStart = openAt + (rawTag ? 3 : 2)
+            let close = SiteUtil.indexFrom(src, closer, bodyStart)
+            if close < 0 {
+                raise "Template " + name + ", line " + SiteUtil.text(self.lineAt(src, openAt)) + ": unclosed " + (rawTag ? "{{{" : "{{")
+            }
+            self.pushText(tokens, src.slice(pos, openAt), trimNext)
+            trimNext = false
+            let inner = src.slice(bodyStart, close)
+            pos = close + len(closer)
+            if inner.startsWith("~") {
+                inner = inner.slice(1)
+                self.trimLastText(tokens)
+            }
+            if inner.endsWith("~") {
+                inner = inner.slice(0, len(inner) - 1)
+                trimNext = true
+            }
+            inner = inner.trim()
+            if rawTag {
+                tokens.push({"k": "var", "raw": true, "src": inner, "at": openAt})
+                continue
+            }
+            if inner.startsWith("!") { continue }
+            if inner.startsWith("#") {
+                let body = inner.slice(1).trim()
+                let space = body.indexOf(" ")
+                let blockName = space < 0 ? body : body.slice(0, space)
+                let arg = space < 0 ? "" : body.slice(space + 1).trim()
+                tokens.push({"k": "open", "name": blockName, "src": arg, "at": openAt})
+            } else if inner.startsWith("/") {
+                tokens.push({"k": "close", "name": inner.slice(1).trim(), "at": openAt})
+            } else if inner == "else" or inner.startsWith("else ") {
+                tokens.push({"k": "else", "src": inner.slice(4).trim(), "at": openAt})
+            } else if inner.startsWith(">") {
+                let body = inner.slice(1).trim()
+                let space = body.indexOf(" ")
+                let partName = space < 0 ? body : body.slice(0, space)
+                let arg = space < 0 ? "" : body.slice(space + 1).trim()
+                tokens.push({"k": "partial", "name": partName, "src": arg, "at": openAt})
+            } else {
+                tokens.push({"k": "var", "raw": false, "src": inner, "at": openAt})
+            }
+        }
+        return tokens
+    }
+
+    fn pushText(tokens, text, trimStart) {
+        let t = text
+        if trimStart { t = self.trimStartText(t) }
+        if t != "" { tokens.push({"k": "text", "v": t}) }
+    }
+
+    fn trimStartText(t) {
+        let k = 0
+        while k < len(t) and SiteUtil.isSpace(t[k]) { k += 1 }
+        return t.slice(k)
+    }
+
+    fn trimLastText(tokens) {
+        if len(tokens) == 0 { return }
+        let last = tokens[len(tokens) - 1]
+        if last["k"] == "text" {
+            last["v"] = SiteUtil.trimEnd(last["v"])
+            if last["v"] == "" { tokens.pop() }
+        }
+    }
+
+    fn lineAt(src, pos) {
+        let line = 1
+        let k = 0
+        while k < pos and k < len(src) {
+            if src[k] == "\n" { line += 1 }
+            k += 1
+        }
+        return line
+    }
+
+    fn fail(src, name, at, message) {
+        raise "Template " + name + ", line " + SiteUtil.text(self.lineAt(src, at)) + ": " + message
+    }
+
+    # ── parser: tokens -> node tree ──────────────────────────────────────
+
+    fn parseTokens(tokens, src, name) {
+        let root = []
+        let stack = [{"node": null, "list": root, "name": ""}]
+        for tok in tokens {
+            let frame = stack[len(stack) - 1]
+            let k = tok["k"]
+            if k == "text" {
+                frame["list"].push({"t": "text", "v": tok["v"]})
+            } else if k == "var" {
+                frame["list"].push({"t": "var", "raw": tok["raw"], "e": self.compileExpr(tok["src"], src, name, tok["at"])})
+            } else if k == "partial" {
+                let arg = tok["src"] == "" ? null : self.compileExpr(tok["src"], src, name, tok["at"])
+                frame["list"].push({"t": "partial", "name": tok["name"], "e": arg, "at": tok["at"]})
+            } else if k == "open" {
+                let block = tok["name"]
+                let node = null
+                let target = null
+                if block == "if" or block == "unless" {
+                    if tok["src"] == "" { self.fail(src, name, tok["at"], "{{#" + block + "}} needs a condition") }
+                    let branch = {"cond": self.compileExpr(tok["src"], src, name, tok["at"]), "negate": block == "unless", "body": []}
+                    node = {"t": "if", "branches": [branch], "alt": []}
+                    target = branch["body"]
+                } else if block == "each" or block == "with" {
+                    if tok["src"] == "" { self.fail(src, name, tok["at"], "{{#" + block + "}} needs a value") }
+                    let exprSrc = tok["src"]
+                    let alias = null
+                    let asAt = exprSrc.indexOf(" as ")
+                    if asAt > 0 {
+                        alias = exprSrc.slice(asAt + 4).trim().replaceAll("|", "").trim()
+                        exprSrc = exprSrc.slice(0, asAt).trim()
+                    }
+                    node = {"t": block, "e": self.compileExpr(exprSrc, src, name, tok["at"]), "alias": alias, "body": [], "alt": []}
+                    target = node["body"]
+                } else {
+                    self.fail(src, name, tok["at"], "unknown block {{#" + block + "}} (use if, unless, each or with)")
+                }
+                frame["list"].push(node)
+                stack.push({"node": node, "list": target, "name": block})
+            } else if k == "else" {
+                if len(stack) == 1 { self.fail(src, name, tok["at"], "{{else}} outside a block") }
+                let node = frame["node"]
+                let rest = tok["src"]
+                if rest.startsWith("if ") and node["t"] == "if" {
+                    let branch = {"cond": self.compileExpr(rest.slice(3).trim(), src, name, tok["at"]), "negate": false, "body": []}
+                    node["branches"].push(branch)
+                    frame["list"] = branch["body"]
+                } else {
+                    frame["list"] = node["alt"]
+                }
+            } else if k == "close" {
+                if len(stack) == 1 { self.fail(src, name, tok["at"], "{{/" + tok["name"] + "}} without an opening block") }
+                if frame["name"] != tok["name"] {
+                    self.fail(src, name, tok["at"], "{{/" + tok["name"] + "}} closes {{#" + frame["name"] + "}}")
+                }
+                stack.pop()
+            }
+        }
+        if len(stack) > 1 {
+            raise "Template " + name + ": {{#" + stack[len(stack) - 1]["name"] + "}} is never closed"
+        }
+        return root
+    }
+
+    # ── expressions ──────────────────────────────────────────────────────
+
+    fn compileExpr(source, src, name, at) {
+        let s = source.trim()
+        if s == "" { self.fail(src, name, at, "empty {{ }}") }
+        if s.startsWith("not ") {
+            return {"kind": "not", "a": self.compileExpr(s.slice(4), src, name, at)}
+        }
+        let orAt = self.findTop(s, " or ")
+        if orAt > 0 {
+            return {"kind": "or", "a": self.compileExpr(s.slice(0, orAt), src, name, at), "b": self.compileExpr(s.slice(orAt + 4), src, name, at)}
+        }
+        let andAt = self.findTop(s, " and ")
+        if andAt > 0 {
+            return {"kind": "and", "a": self.compileExpr(s.slice(0, andAt), src, name, at), "b": self.compileExpr(s.slice(andAt + 5), src, name, at)}
+        }
+        for op in [" == ", " != "] {
+            let k = self.findTop(s, op)
+            if k > 0 {
+                return {"kind": "cmp", "op": op.trim(), "a": self.compileExpr(s.slice(0, k), src, name, at), "b": self.compileExpr(s.slice(k + 4), src, name, at)}
+            }
+        }
+        let parts = self.topParts(s, "|")
+        let value = self.compileOperand(parts[0].trim())
+        if len(parts) == 1 { return value }
+        let filters = []
+        for pi in range(1, len(parts)) {
+            let words = self.argWords(parts[pi].trim())
+            if len(words) == 0 { self.fail(src, name, at, "empty filter in {{ " + s + " }}") }
+            let args = []
+            for j in range(1, len(words)) { args.push(self.compileOperand(words[j])) }
+            filters.push({"name": words[0], "args": args})
+        }
+        return {"kind": "pipe", "value": value, "filters": filters}
+    }
+
+    fn compileOperand(tok) {
+        let t = tok.trim()
+        if len(t) >= 2 and (t[0] == "\"" or t[0] == "'") and t[len(t) - 1] == t[0] {
+            return {"kind": "lit", "v": t.slice(1, len(t) - 1)}
+        }
+        if t == "true" { return {"kind": "lit", "v": true} }
+        if t == "false" { return {"kind": "lit", "v": false} }
+        if t == "null" or t == "nil" { return {"kind": "lit", "v": null} }
+        if self.isNumber(t) { return {"kind": "lit", "v": num(t)} }
+        let parts = []
+        if t != "this" and t != "." {
+            for seg in t.split(".") {
+                if seg != "" { parts.push(seg) }
+            }
+        }
+        if t.startsWith("this.") { parts = parts.slice(1) }
+        return {"kind": "path", "parts": parts}
+    }
+
+    fn isNumber(t) {
+        if t == "" { return false }
+        let first = t[0] == "-" ? 1 : 0
+        if first == len(t) { return false }
+        let dots = 0
+        for k in range(first, len(t)) {
+            if t[k] == "." {
+                dots += 1
+            } else if not t[k].isdigit() {
+                return false
+            }
+        }
+        return dots <= 1
+    }
+
+    # Index of `needle` outside quotes, or -1.
+    fn findTop(s, needle) {
+        let quote = ""
+        let k = 0
+        let n = len(s)
+        let m = len(needle)
+        while k < n {
+            let c = s[k]
+            if quote != "" {
+                if c == quote { quote = "" }
+            } else if c == "\"" or c == "'" {
+                quote = c
+            } else if s.slice(k, k + m) == needle {
+                return k
+            }
+            k += 1
+        }
+        return -1
+    }
+
+    # Pieces of `s` between `sep` characters that are outside quotes.
+    fn topParts(s, sep) {
+        let parts = []
+        let cur = []
+        let quote = ""
+        for k in range(len(s)) {
+            let c = s[k]
+            if quote != "" {
+                cur.push(c)
+                if c == quote { quote = "" }
+            } else if c == "\"" or c == "'" {
+                quote = c
+                cur.push(c)
+            } else if c == sep {
+                parts.push(cur.join(""))
+                cur = []
+            } else {
+                cur.push(c)
+            }
+        }
+        parts.push(cur.join(""))
+        return parts
+    }
+
+    # Whitespace-separated words; quoted strings stay whole.
+    fn argWords(s) {
+        let words = []
+        let cur = []
+        let quote = ""
+        for k in range(len(s)) {
+            let c = s[k]
+            if quote != "" {
+                cur.push(c)
+                if c == quote { quote = "" }
+            } else if c == "\"" or c == "'" {
+                quote = c
+                cur.push(c)
+            } else if c == " " or c == "\t" {
+                if len(cur) > 0 {
+                    words.push(cur.join(""))
+                    cur = []
+                }
+            } else {
+                cur.push(c)
+            }
+        }
+        if len(cur) > 0 { words.push(cur.join("")) }
+        return words
+    }
+
+    # ── evaluation ───────────────────────────────────────────────────────
+
+    fn evaluate(e, scopes) {
+        let kind = e["kind"]
+        if kind == "lit" { return e["v"] }
+        if kind == "path" { return self.lookup(scopes, e["parts"]) }
+        if kind == "not" { return not self.truthy(self.evaluate(e["a"], scopes)) }
+        if kind == "and" { return self.truthy(self.evaluate(e["a"], scopes)) and self.truthy(self.evaluate(e["b"], scopes)) }
+        if kind == "or" {
+            let left = self.evaluate(e["a"], scopes)
+            if self.truthy(left) { return left }
+            return self.evaluate(e["b"], scopes)
+        }
+        if kind == "cmp" {
+            let same = self.sameValue(self.evaluate(e["a"], scopes), self.evaluate(e["b"], scopes))
+            return e["op"] == "==" ? same : not same
+        }
+        let v = self.evaluate(e["value"], scopes)
+        for f in e["filters"] {
+            let args = []
+            for a in f["args"] { args.push(self.evaluate(a, scopes)) }
+            v = self.applyFilter(f["name"], v, args, scopes)
+        }
+        return v
+    }
+
+    fn sameValue(a, b) {
+        if a == null or b == null { return a == null and b == null }
+        if type(a) == type(b) and (type(a) == "string" or type(a) == "number" or type(a) == "bool") { return a == b }
+        return SiteUtil.text(a) == SiteUtil.text(b)
+    }
+
+    fn lookup(scopes, parts) {
+        let top = scopes[len(scopes) - 1]
+        if len(parts) == 0 { return top["ctx"] }
+        let first = parts[0]
+        let v = null
+        if first == "@root" {
+            v = scopes[0]["ctx"]
+        } else if first.startsWith("@") {
+            let k = len(scopes) - 1
+            while k >= 0 {
+                if first in scopes[k]["locals"] {
+                    v = scopes[k]["locals"][first]
+                    break
+                }
+                k -= 1
+            }
+        } else {
+            let found = false
+            let k = len(scopes) - 1
+            while k >= 0 and not found {
+                let frame = scopes[k]
+                if first in frame["locals"] {
+                    v = frame["locals"][first]
+                    found = true
+                } else if type(frame["ctx"]) == "dict" and first in frame["ctx"] {
+                    v = frame["ctx"][first]
+                    found = true
+                }
+                k -= 1
+            }
+            if not found { return null }
+        }
+        for j in range(1, len(parts)) {
+            v = self.member(v, parts[j])
+            if v == null { return null }
+        }
+        return v
+    }
+
+    fn member(v, key) {
+        let t = type(v)
+        if t == "dict" { return v.get(key, null) }
+        if t == "array" {
+            if key == "length" or key == "size" { return len(v) }
+            if key == "first" { return len(v) > 0 ? v[0] : null }
+            if key == "last" { return len(v) > 0 ? v[len(v) - 1] : null }
+            if SiteUtil.digitsOnly(key) {
+                let idx = num(key)
+                return idx < len(v) ? v[idx] : null
+            }
+            return null
+        }
+        if t == "string" and (key == "length" or key == "size") { return len(v) }
+        return null
+    }
+
+    fn truthy(v) {
+        if v == null { return false }
+        let t = type(v)
+        if t == "bool" { return v }
+        if t == "number" { return v != 0 }
+        if t == "string" { return v != "" }
+        if t == "array" { return len(v) > 0 }
+        if t == "dict" { return len(v.keys()) > 0 }
+        return true
+    }
+
+    fn display(v) {
+        if v == null { return "" }
+        let t = type(v)
+        if t == "array" {
+            let parts = []
+            for x in v { parts.push(self.display(x)) }
+            return parts.join(", ")
+        }
+        if t == "bool" { return v ? "true" : "false" }
+        if t == "dict" { return JSON.stringify(v) }
+        return SiteUtil.text(v)
+    }
+
+    # ── filters ──────────────────────────────────────────────────────────
+
+    fn arg(args, k, fallback) {
+        if k < len(args) and args[k] != null { return args[k] }
+        return fallback
+    }
+
+    fn applyFilter(name, v, args, scopes) {
+        if name in self.custom {
+            let handler = self.custom[name]
+            return handler(v, args)
+        }
+        if name == "upper" { return self.display(v).upper() }
+        if name == "lower" { return self.display(v).lower() }
+        if name == "capitalize" {
+            let s = self.display(v)
+            return s == "" ? s : s[0].upper() + s.slice(1)
+        }
+        if name == "trim" { return self.display(v).trim() }
+        if name == "default" { return self.truthy(v) ? v : self.arg(args, 0, "") }
+        if name == "date" { return SiteUtil.formatDate(v, self.arg(args, 0, "long")) }
+        if name == "slug" or name == "slugify" { return SiteUtil.slugify(self.display(v)) }
+        if name == "truncate" { return SiteUtil.truncateChars(self.display(v), self.arg(args, 0, 100)) }
+        if name == "words" { return SiteUtil.truncateWords(self.display(v), self.arg(args, 0, 30)) }
+        if name == "striptags" { return SiteUtil.stripTags(self.display(v)) }
+        if name == "escape" or name == "xml" { return SiteUtil.escapeHtml(self.display(v)) }
+        if name == "markdown" { return Markdown.render(self.display(v)) }
+        if name == "inline" { return Markdown.renderInline(self.display(v)) }
+        if name == "json" { return JSON.stringify(v) }
+        if name == "wordcount" { return SiteUtil.wordCount(self.display(v)) }
+        if name == "length" or name == "size" or name == "count" {
+            let t = type(v)
+            if t == "array" or t == "string" { return len(v) }
+            if t == "dict" { return len(v.keys()) }
+            return 0
+        }
+        if name == "join" {
+            if type(v) != "array" { return self.display(v) }
+            let parts = []
+            for x in v { parts.push(self.display(x)) }
+            return parts.join(self.arg(args, 0, ", "))
+        }
+        if name == "first" { return self.member(v, "first") }
+        if name == "last" { return self.member(v, "last") }
+        if name == "limit" {
+            if type(v) != "array" { return v }
+            return v.slice(0, self.arg(args, 0, len(v)))
+        }
+        if name == "offset" {
+            if type(v) != "array" { return v }
+            return v.slice(self.arg(args, 0, 0))
+        }
+        if name == "reverse" {
+            if type(v) == "array" {
+                let out = []
+                let k = len(v) - 1
+                while k >= 0 {
+                    out.push(v[k])
+                    k -= 1
+                }
+                return out
+            }
+            let s = self.display(v)
+            let chars = []
+            let k = len(s) - 1
+            while k >= 0 {
+                chars.push(s[k])
+                k -= 1
+            }
+            return chars.join("")
+        }
+        if name == "sort" {
+            if type(v) != "array" { return v }
+            let field = self.arg(args, 0, "")
+            let desc = self.arg(args, 1, "") == "desc"
+            if field == "" {
+                let ordered = SiteUtil.sortStrings(v)
+                return desc ? self.applyFilter("reverse", ordered, [], scopes) : ordered
+            }
+            return SiteUtil.sortRecords(v, field, desc)
+        }
+        if name == "where" {
+            if type(v) != "array" { return [] }
+            let field = self.arg(args, 0, "")
+            let want = self.arg(args, 1, true)
+            let out = []
+            for item in v {
+                if type(item) == "dict" {
+                    let have = item.get(field, null)
+                    if type(have) == "array" {
+                        for h in have {
+                            if self.sameValue(h, want) {
+                                out.push(item)
+                                break
+                            }
+                        }
+                    } else if self.sameValue(have, want) {
+                        out.push(item)
+                    }
+                }
+            }
+            return out
+        }
+        if name == "plus" { return num(self.display(v)) + self.arg(args, 0, 1) }
+        if name == "minus" { return num(self.display(v)) - self.arg(args, 0, 1) }
+        if name == "append" { return self.display(v) + self.display(self.arg(args, 0, "")) }
+        if name == "prepend" { return self.display(self.arg(args, 0, "")) + self.display(v) }
+        if name == "replace" { return self.display(v).replaceAll(self.display(self.arg(args, 0, "")), self.display(self.arg(args, 1, ""))) }
+        if name == "plural" {
+            let count = type(v) == "array" ? len(v) : v
+            return count == 1 ? self.arg(args, 0, "") : self.arg(args, 1, self.display(self.arg(args, 0, "")) + "s")
+        }
+        if name == "rel" {
+            let url = self.display(v)
+            if url.startsWith("http://") or url.startsWith("https://") or url.startsWith("#") or url.startsWith("mailto:") { return url }
+            if url.startsWith("/") { url = url.slice(1) }
+            let root = self.lookup(scopes, ["page", "root"])
+            if root == null { root = "" }
+            if url == "" or url == "index.html" { return root == "" ? "index.html" : root + "index.html" }
+            return root + url
+        }
+        if name == "abs" {
+            let base = self.display(self.lookup(scopes, ["site", "baseUrl"]))
+            let url = self.display(v)
+            if url.startsWith("http://") or url.startsWith("https://") { return url }
+            if base == "" { return url }
+            if base.endsWith("/") { base = base.slice(0, len(base) - 1) }
+            if url.startsWith("/") { url = url.slice(1) }
+            return base + "/" + url
+        }
+        raise "unknown template filter '" + name + "'"
+    }
+
+    # ── rendering ────────────────────────────────────────────────────────
+
+    fn renderNodes(nodes, scopes, out, depth, name) {
+        if depth > self.MAX_DEPTH { raise "Template " + name + ": partials nested too deeply (a partial including itself?)" }
+        for node in nodes {
+            let t = node["t"]
+            if t == "text" {
+                out.push(node["v"])
+            } else if t == "var" {
+                let v = self.evaluate(node["e"], scopes)
+                if node["raw"] {
+                    out.push(self.display(v))
+                } else {
+                    out.push(SiteUtil.escapeHtml(self.display(v)))
+                }
+            } else if t == "if" {
+                let matched = false
+                for b in node["branches"] {
+                    let ok = self.truthy(self.evaluate(b["cond"], scopes))
+                    if b["negate"] { ok = not ok }
+                    if ok {
+                        self.renderNodes(b["body"], scopes, out, depth, name)
+                        matched = true
+                        break
+                    }
+                }
+                if not matched { self.renderNodes(node["alt"], scopes, out, depth, name) }
+            } else if t == "each" {
+                self.renderEach(node, scopes, out, depth, name)
+            } else if t == "with" {
+                let v = self.evaluate(node["e"], scopes)
+                if self.truthy(v) {
+                    let locals = {}
+                    if node["alias"] != null { locals[node["alias"]] = v }
+                    scopes.push({"ctx": v, "locals": locals})
+                    self.renderNodes(node["body"], scopes, out, depth, name)
+                    scopes.pop()
+                } else {
+                    self.renderNodes(node["alt"], scopes, out, depth, name)
+                }
+            } else if t == "partial" {
+                if not (node["name"] in self.partials) {
+                    raise "Template " + name + ": unknown partial '" + node["name"] + "' (add layouts/partials/" + node["name"] + ".html)"
+                }
+                let part = self.partials[node["name"]]
+                if node["e"] != null {
+                    scopes.push({"ctx": self.evaluate(node["e"], scopes), "locals": {}})
+                    self.renderNodes(part["nodes"], scopes, out, depth + 1, part["name"])
+                    scopes.pop()
+                } else {
+                    self.renderNodes(part["nodes"], scopes, out, depth + 1, part["name"])
+                }
+            }
+        }
+    }
+
+    fn renderEach(node, scopes, out, depth, name) {
+        let v = self.evaluate(node["e"], scopes)
+        let alias = node["alias"]
+        let t = type(v)
+        if t == "array" and len(v) > 0 {
+            let n = len(v)
+            for k in range(n) {
+                let locals = {"@index": k, "@number": k + 1, "@first": k == 0, "@last": k == n - 1}
+                if alias != null { locals[alias] = v[k] }
+                scopes.push({"ctx": alias == null ? v[k] : scopes[len(scopes) - 1]["ctx"], "locals": locals})
+                self.renderNodes(node["body"], scopes, out, depth, name)
+                scopes.pop()
+            }
+            return
+        }
+        if t == "dict" and len(v.keys()) > 0 {
+            let keys = SiteUtil.sortStrings(v.keys())
+            let n = len(keys)
+            for k in range(n) {
+                let key = keys[k]
+                let locals = {"@index": k, "@number": k + 1, "@first": k == 0, "@last": k == n - 1, "@key": key}
+                if alias != null { locals[alias] = v[key] }
+                scopes.push({"ctx": alias == null ? v[key] : scopes[len(scopes) - 1]["ctx"], "locals": locals})
+                self.renderNodes(node["body"], scopes, out, depth, name)
+                scopes.pop()
+            }
+            return
+        }
+        self.renderNodes(node["alt"], scopes, out, depth, name)
+    }
+}
+
+Template = __QTemplate()
