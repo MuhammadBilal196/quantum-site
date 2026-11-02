@@ -1,0 +1,146 @@
+# quantum-site — command-line entry point
+#
+#   qrun quantum-site-cli.sa init [folder] [--title "My Blog"]   create a starter site
+#   qrun quantum-site-cli.sa build [--drafts] [--out folder]     build into public/
+#   qrun quantum-site-cli.sa new "Post title" [--tags a,b]       start a new post
+#   qrun quantum-site-cli.sa help | version
+#
+# With no command it builds the site in the current folder, or creates a starter
+# site first when there is no site.json yet.
+#
+# dist/quantum-site-cli.sa is this file bundled with the library; rebuild it after
+# changing src/.
+
+# @use ../index.sa
+
+# Quantum has no exit(); an uncaught raise is what gives a non-zero exit code.
+fn __qsFail(message) {
+    raise "[quantum-site] " + message
+}
+
+fn __qsUsage() {
+    return [
+        "quantum-site " + Site.VERSION + " - static site generator for Quantum",
+        "",
+        "usage: qrun quantum-site-cli.sa <command> [options]",
+        "",
+        "  init [folder] [--title T]    create a starter site (never overwrites files)",
+        "  build [--drafts] [--out D]   build content/ + layouts/ + static/ into public/",
+        "  new \"Title\" [--tags a,b]     create content/posts/<today>-<slug>.md",
+        "  help                         show this help",
+        "  version                      print the version",
+        "",
+        "With no command: build, or init + build when there is no site.json yet."
+    ].join("\n")
+}
+
+# Splits argv into {"positional": [...], "flags": {...}}; "--name value" or "--name".
+fn __qsArgs(argv) {
+    let positional = []
+    let flags = {}
+    let k = 0
+    while k < len(argv) {
+        let a = argv[k]
+        if a.startsWith("--") {
+            let name = a.slice(2)
+            let eq = name.indexOf("=")
+            if eq > 0 {
+                flags[name.slice(0, eq)] = name.slice(eq + 1)
+            } else if k + 1 < len(argv) and not argv[k + 1].startsWith("--") and name != "drafts" {
+                flags[name] = argv[k + 1]
+                k += 1
+            } else {
+                flags[name] = true
+            }
+        } else if a == "-h" {
+            flags["help"] = true
+        } else {
+            positional.push(a)
+        }
+        k += 1
+    }
+    return {"positional": positional, "flags": flags}
+}
+
+fn __qsInit(folder, title) {
+    let result = SiteStarter.create(folder, {"title": title})
+    let place = folder == "." ? "this folder" : folder + "/"
+    print("[quantum-site] starter site in " + place + ": " + str(len(result["created"])) + " files created, "
+        + str(len(result["skipped"])) + " already there")
+    return result
+}
+
+fn __qsBuild(root, flags) {
+    let options = {"root": root}
+    if flags.get("drafts", false) { options["drafts"] = true }
+    if "out" in flags { options["outDir"] = flags["out"] }
+    let report = null
+    let problem = ""
+    try {
+        report = Site.build(options)
+    } catch (e) {
+        problem = str(e)
+    }
+    if problem != "" { __qsFail(problem) }
+    print("[quantum-site] " + Site.summary(report))
+    print("[quantum-site] open " + report["outDir"] + "/index.html in your browser")
+    return report
+}
+
+fn __qsMain() {
+    let argv = []
+    if sys.argv != null and len(sys.argv) > 1 { argv = sys.argv.slice(1) }
+    let parsed = __qsArgs(argv)
+    let pos = parsed["positional"]
+    let flags = parsed["flags"]
+    let command = len(pos) > 0 ? pos[0] : ""
+
+    if flags.get("help", false) or command == "help" {
+        print(__qsUsage())
+        return
+    }
+    if flags.get("version", false) or command == "version" {
+        print("quantum-site " + Site.VERSION)
+        return
+    }
+    if command == "" {
+        if not os.path.exists("site.json") {
+            __qsInit(".", flags.get("title", ""))
+        }
+        __qsBuild(".", flags)
+        return
+    }
+    if command == "init" {
+        let folder = len(pos) > 1 ? pos[1] : "."
+        __qsInit(folder, flags.get("title", ""))
+        print("[quantum-site] next: cd " + folder + " and run `qrun quantum-site-cli.sa build`")
+        return
+    }
+    if command == "build" {
+        __qsBuild(len(pos) > 1 ? pos[1] : ".", flags)
+        return
+    }
+    if command == "new" {
+        if len(pos) < 2 { __qsFail("usage: new \"Post title\" [--tags a,b]") }
+        let title = pos.slice(1).join(" ")
+        let tags = []
+        if "tags" in flags and flags["tags"] != true {
+            for t in flags["tags"].split(",") {
+                if t.trim() != "" { tags.push(t.trim()) }
+            }
+        }
+        let path = ""
+        let problem = ""
+        try {
+            path = Site.newPost(".", title, tags)
+        } catch (e) {
+            problem = str(e)
+        }
+        if problem != "" { __qsFail(problem) }
+        print("[quantum-site] created " + path)
+        return
+    }
+    __qsFail("unknown command '" + command + "'\n\n" + __qsUsage())
+}
+
+__qsMain()
